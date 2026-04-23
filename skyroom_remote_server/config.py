@@ -55,6 +55,7 @@ class ServiceConfig:
     server_name: str = os.getenv("SKYROOM_SERVER_NAME", "My Skyroom Remote")
     public_host: str = os.getenv("SKYROOM_PUBLIC_HOST", "")
     public_port: int = _env_int("SKYROOM_PUBLIC_PORT", _env_int("SKYROOM_PORT", 8765))
+    health_port: int = _env_int("SKYROOM_HEALTH_PORT", 8080)
 
 
 @dataclass(frozen=True)

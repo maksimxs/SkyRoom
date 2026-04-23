@@ -8,7 +8,7 @@ It does not depend on `pygame`.
 
 - Runs the multiplayer Skyroom server
 - Responds to lightweight `ping` checks from the client
-- Exposes `GET /health` on the same public game port
+- Exposes `GET /health` on a separate HTTP port
 - Calls the external endpoint `POST /check-up` on startup
 - Can call `POST /check-up` again after successful player joins
 
@@ -41,12 +41,18 @@ This package is prepared for that future step via `SKYROOM_ENDPOINT_BASE_URL`.
 python server.py
 ```
 
+By default:
+
+- game server: `8765`
+- health endpoint: `8080`
+
 ## Environment
 
 Core server settings:
 
 - `SKYROOM_HOST`
 - `SKYROOM_PORT`
+- `SKYROOM_HEALTH_PORT`
 - `SKYROOM_TICK_RATE`
 - `SKYROOM_PLAYER_SPEED`
 
@@ -59,6 +65,12 @@ Remote endpoint settings:
 
 ## /health response
 
+The health endpoint is now served on:
+
+```text
+http://<server_host>:8080/health
+```
+
 ```json
 {
   "status": true,
@@ -67,6 +79,12 @@ Remote endpoint settings:
   "server_port": 8765,
   "online": 3
 }
+```
+
+Backend or worker health-check URL example:
+
+```text
+http://213.108.4.34:8080/health
 ```
 
 ## /check-up payload

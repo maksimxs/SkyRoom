@@ -7,12 +7,14 @@ from pathlib import Path
 import json
 import queue
 import re
+import socket
 import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Callable, Dict, Iterable, Optional
 
+from ..config import SERVICE
 
 DEFAULT_SERVER_PATH = Path("servers.json")
 DEFAULT_BROWSER_STATE_PATH = Path("server_browser_state.json")
@@ -182,7 +184,7 @@ class ServerStatusChecker:
 
     def check_once(self, server: ServerEntry) -> HealthResult:
         started = time.perf_counter()
-        url = f"http://{server.host}:{server.port}/health"
+        url = f"http://{server.host}:{SERVICE.health_port}/health"
         self._log("HEALTH", f"REQUEST GET {url}")
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as response:
@@ -199,7 +201,15 @@ class ServerStatusChecker:
                     status_flag=ok,
                 )
                 self._log("HEALTH", f"RESPONSE GET {url} {payload}")
-        except (urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError, TimeoutError, ValueError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            json.JSONDecodeError,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+            ValueError,
+        ) as exc:
             result = HealthResult(online=False, ping_ms=None, checked_at=time.time(), status_flag=False)
             self._log("HEALTH", f"RESPONSE GET {url} ERROR {exc}")
         self.results[server.key] = result
@@ -223,7 +233,7 @@ class ServerStatusChecker:
             result = self.check_once(server)
         except Exception as exc:
             result = HealthResult(online=False, ping_ms=None, checked_at=time.time(), status_flag=False)
-            url = f"http://{server.host}:{server.port}/health"
+            url = f"http://{server.host}:{SERVICE.health_port}/health"
             self._log("HEALTH", f"RESPONSE GET {url} ERROR unexpected {exc}")
         self._queue.put((server.key, result))
 

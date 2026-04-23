@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 import pygame
 
-from ..config import CLIENT, ENDPOINT, NETWORK
+from ..config import CLIENT, ENDPOINT, NETWORK, SERVICE
 from .chrome import create_window_icon, draw_custom_cursor
 from .debug import DebugConsole
 from .endpoint import EndpointClient, EndpointServerRecord
@@ -526,7 +526,14 @@ class SkyroomLauncherApp:
     def connect_to_server(self, server: ServerEntry) -> None:
         self.status = f"Checking {server.host}:{server.port}..."
         self.draw()
-        result = self.checker.check_once(server)
+        try:
+            result = self.checker.check_once(server)
+        except Exception as exc:
+            self.status = ""
+            if self.debug_console:
+                self.debug_console.log("HEALTH", f"RESPONSE GET http://{server.host}:{SERVICE.health_port}/health ERROR unexpected {exc}")
+            self.push_toast(f"{server.name} is offline or unreachable.", kind="error")
+            return
         if not result.online:
             self.status = ""
             self.push_toast(f"{server.name} is offline or unreachable.", kind="error")

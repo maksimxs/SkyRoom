@@ -26,14 +26,19 @@ class GameServer:
         self.map_layout = MapLayout.build_default()
         self.sessions: Dict[str, ClientSession] = {}
         self.server: Optional[asyncio.AbstractServer] = None
+        self.health_server: Optional[asyncio.AbstractServer] = None
         self._tick_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(self.handle_connection, NETWORK.host, NETWORK.port)
+        self.health_server = await asyncio.start_server(self.handle_health_connection, NETWORK.host, SERVICE.health_port)
         self._tick_task = asyncio.create_task(self.game_loop(), name="game-loop")
         sockets = self.server.sockets or []
         addresses = ", ".join(str(sock.getsockname()) for sock in sockets)
         print(f"Skyroom server listening on {addresses}")
+        health_sockets = self.health_server.sockets or []
+        health_addresses = ", ".join(str(sock.getsockname()) for sock in health_sockets)
+        print(f"Skyroom health listening on {health_addresses}")
 
     async def stop(self) -> None:
         if self._tick_task:
@@ -43,6 +48,9 @@ class GameServer:
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+        if self.health_server:
+            self.health_server.close()
+            await self.health_server.wait_closed()
         for session in list(self.sessions.values()):
             session.writer.close()
             with contextlib.suppress(Exception):
@@ -55,9 +63,6 @@ class GameServer:
             raw_line = await reader.readline()
             if not raw_line:
                 raise ConnectionError("Socket closed")
-            if raw_line.startswith(b"GET /health "):
-                await self.respond_health(writer)
-                return
             hello = decode_message(raw_line)
             if hello.get("type") == "ping":
                 await send_message(writer, {"type": "pong", "server": "skyroom"})
@@ -105,6 +110,24 @@ class GameServer:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+    async def handle_health_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            request_line = await reader.readline()
+            if not request_line:
+                return
+            while True:
+                header_line = await reader.readline()
+                if not header_line or header_line in (b"\r\n", b"\n"):
+                    break
+            if request_line.startswith(b"GET /health "):
+                await self.respond_health(writer)
+            else:
+                await self.respond_not_found(writer)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
     async def respond_health(self, writer: asyncio.StreamWriter) -> None:
         payload = {
             "status": True,
@@ -113,9 +136,16 @@ class GameServer:
             "server_port": SERVICE.public_port,
             "online": len(self.sessions),
         }
+        await self.respond_json(writer, 200, payload)
+
+    async def respond_not_found(self, writer: asyncio.StreamWriter) -> None:
+        await self.respond_json(writer, 404, {"status": False})
+
+    async def respond_json(self, writer: asyncio.StreamWriter, status_code: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
+        reason = "OK" if status_code == 200 else "Not Found"
         header = (
-            "HTTP/1.1 200 OK\r\n"
+            f"HTTP/1.1 {status_code} {reason}\r\n"
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(body)}\r\n"
             "Connection: close\r\n\r\n"
