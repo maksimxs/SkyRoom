@@ -2,25 +2,30 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import random
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import pygame
 
-from ..config import CLIENT, NETWORK
+from ..config import CLIENT, ENDPOINT, NETWORK
 from .chrome import create_window_icon, draw_custom_cursor
+from .debug import DebugConsole
+from .endpoint import EndpointClient, EndpointServerRecord
 from .rendering import PALETTE, pick_font_name
-from .servers import ServerEntry, ServerStatusChecker, ServerStore
+from .servers import BrowserStateStore, ServerEntry, ServerStatusChecker, ServerStore, is_valid_host, is_valid_server_entry
 from .state import add_alpha, blend
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SERVERS_PATH = PROJECT_ROOT / "servers.json"
+BROWSER_STATE_PATH = PROJECT_ROOT / "server_browser_state.json"
 
 
 @dataclass
@@ -38,6 +43,27 @@ class Button:
 
     def hit(self, pos: tuple[int, int]) -> bool:
         return self.enabled and self.rect.collidepoint(pos)
+
+
+@dataclass
+class DisplayedServer:
+    server: ServerEntry
+    local_index: Optional[int]
+    from_endpoint: bool
+    endpoint_status: bool
+    is_new: bool
+
+    @property
+    def key(self) -> str:
+        return self.server.key
+
+
+@dataclass
+class LauncherToast:
+    text: str
+    kind: str
+    created_at: float
+    duration: float = 3.4
 
 
 class TextInput:
@@ -65,13 +91,7 @@ class TextInput:
 
 
 class ModalForm:
-    def __init__(
-        self,
-        title: str,
-        fields: list[TextInput],
-        on_submit: Callable[[list[str]], None],
-        submit_label: str,
-    ) -> None:
+    def __init__(self, title: str, fields: list[TextInput], on_submit: Callable[[list[str]], None], submit_label: str) -> None:
         self.title = title
         self.fields = fields
         self.on_submit = on_submit
@@ -94,14 +114,18 @@ class ModalForm:
                 self.fields[active_index].active = False
                 self.fields[(active_index + 1) % len(self.fields)].active = True
                 return True
-
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.submit_rect.collidepoint(event.pos):
                 self.submit()
                 return True
             if self.cancel_rect.collidepoint(event.pos):
                 return False
-
+            clicked_field = False
+            for field in self.fields:
+                field.active = field.rect.collidepoint(event.pos)
+                clicked_field = clicked_field or field.active
+            if clicked_field:
+                return True
         for field in self.fields:
             field.handle_event(event)
         return True
@@ -129,16 +153,25 @@ class SkyroomLauncherApp:
         self.font_small = pygame.font.SysFont(self.font_name, 17)
         self.running = True
         self.scene = "main"
-        self.status = "Choose a mode."
+        self.status = ""
         self.modal: Optional[ModalForm] = None
         self.server_process: Optional[ManagedProcess] = None
-        self.client_processes: List[ManagedProcess] = []
+        self.client_processes: list[ManagedProcess] = []
         self.client_counter = 0
+        self.debug_console = DebugConsole()
         self.store = ServerStore(SERVERS_PATH)
-        self.checker = ServerStatusChecker()
+        self.browser_state = BrowserStateStore(BROWSER_STATE_PATH)
+        self.endpoint = EndpointClient(base_url=ENDPOINT.base_url, timeout=ENDPOINT.timeout, logger=self.debug_console.log)
+        self.checker = ServerStatusChecker(logger=self.debug_console.log)
+        self.endpoint_servers: list[EndpointServerRecord] = []
+        self.new_endpoint_keys: set[str] = set()
+        self.endpoint_loading = False
+        self.endpoint_queue: "queue.Queue[tuple[bool, list[EndpointServerRecord], str]]" = queue.Queue()
         self.selected_server = 0
-        self.signal_rects: list[tuple[pygame.Rect, ServerEntry]] = []
+        self.signal_rects: list[tuple[pygame.Rect, DisplayedServer]] = []
+        self.toasts: list[LauncherToast] = []
         self.context_menu_pos: Optional[tuple[int, int]] = None
+        self.context_menu_kind: Optional[str] = None
         self.context_menu_index: Optional[int] = None
         self.last_click_index: Optional[int] = None
         self.last_click_at = 0.0
@@ -162,10 +195,42 @@ class SkyroomLauncherApp:
             dt = min(0.05, self.clock.tick(CLIENT.fps) / 1000.0)
             self.cloud_phase += dt
             self.cleanup_finished()
-            self.checker.tick(self.store.servers)
+            self.update_toasts()
+            self.consume_endpoint_results()
+            self.checker.tick([item.server for item in self.displayed_servers()])
             self.handle_events()
             self.draw()
         self.shutdown()
+
+    def main_menu_buttons(self) -> list[Button]:
+        width, height = self.screen.get_size()
+        button_w, button_h = 250, 58
+        x = width // 2 - button_w // 2
+        y = height // 2 - 62
+        return [
+            Button(pygame.Rect(x, y, button_w, button_h), "Online", self.open_online),
+            Button(pygame.Rect(x, y + 76, button_w, button_h), "Offline", self.open_offline),
+            Button(pygame.Rect(x, y + 152, button_w, button_h), "Exit", self.exit_app),
+        ]
+
+    def current_buttons(self) -> list[Button]:
+        width, height = self.screen.get_size()
+        if self.scene == "main":
+            return self.main_menu_buttons()
+        if self.scene == "offline":
+            bottom = height - 96
+            return [
+                Button(pygame.Rect(56, bottom, 180, 54), "Start Server", self.start_server),
+                Button(pygame.Rect(252, bottom, 180, 54), "New Client", lambda: self.start_client(server_name="Local Skyroom", ensure_local_server=True)),
+                Button(pygame.Rect(width - 190, bottom, 134, 54), "Back", self.back_to_main),
+            ]
+        bottom = height - 88
+        right = width - 56
+        return [
+            Button(pygame.Rect(56, bottom, 192, 52), "Direct Connect", self.open_direct_connect_modal),
+            Button(pygame.Rect(264, bottom, 148, 52), "Add Server", self.open_add_modal),
+            Button(pygame.Rect(right - 128, bottom, 128, 52), "Back", self.back_to_main),
+        ]
 
     def handle_events(self) -> None:
         for event in pygame.event.get():
@@ -177,6 +242,11 @@ class SkyroomLauncherApp:
                 height = max(560, event.h)
                 self.screen = pygame.display.set_mode((width, height), pygame.RESIZABLE)
                 continue
+            if self.debug_console.handle_event(event, self.screen.get_size()):
+                continue
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_d and (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                self.debug_console.toggle()
+                continue
             if self.modal:
                 keep_modal = self.modal.handle_event(event)
                 if not keep_modal:
@@ -187,20 +257,20 @@ class SkyroomLauncherApp:
                     self.running = False
                 else:
                     self.scene = "main"
+                self.context_menu_kind = None
                 continue
-            if event.type == pygame.KEYDOWN and self.scene == "offline":
-                if event.key == pygame.K_x:
-                    self.start_client(ensure_local_server=True)
-                    continue
+            if event.type == pygame.KEYDOWN and self.scene == "offline" and event.key == pygame.K_x:
+                self.start_client(server_name="Local Skyroom", ensure_local_server=True)
+                continue
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 3 and self.scene == "online":
                     self.open_context_menu_at(event.pos)
                     continue
                 if event.button != 1:
                     continue
-                if self.context_menu_pos and self.handle_context_menu_click(event.pos):
+                if self.context_menu_kind and self.handle_context_menu_click(event.pos):
                     continue
-                self.context_menu_pos = None
+                self.context_menu_kind = None
                 for button in self.current_buttons():
                     if button.hit(event.pos):
                         button.action()
@@ -208,54 +278,80 @@ class SkyroomLauncherApp:
                 if self.scene == "online":
                     self.handle_server_left_click(event.pos)
 
-    def current_buttons(self) -> list[Button]:
-        width, height = self.screen.get_size()
-        if self.scene == "main":
-            button_w, button_h = 250, 58
-            x = width // 2 - button_w // 2
-            y = height // 2 - 62
-            return [
-                Button(pygame.Rect(x, y, button_w, button_h), "Online", self.open_online),
-                Button(pygame.Rect(x, y + 76, button_w, button_h), "Offline", self.open_offline),
-                Button(pygame.Rect(x, y + 152, button_w, button_h), "Exit", self.exit_app),
+    def displayed_servers(self) -> list[DisplayedServer]:
+        combined: dict[str, DisplayedServer] = {}
+        ordered_keys: list[str] = []
+        for record in self.endpoint_servers:
+            key = record.key
+            if key not in combined:
+                combined[key] = DisplayedServer(
+                    server=ServerEntry(record.server_name[:32], record.server_host[:128], record.server_port),
+                    local_index=None,
+                    from_endpoint=True,
+                    endpoint_status=record.status,
+                    is_new=key in self.new_endpoint_keys,
+                )
+                ordered_keys.append(key)
+        for index, local_server in enumerate(self.store.servers):
+            key = local_server.key
+            if key in combined:
+                combined[key].local_index = index
+                continue
+            combined[key] = DisplayedServer(local_server, index, False, False, False)
+            ordered_keys.append(key)
+        return [combined[key] for key in ordered_keys]
+
+    def consume_endpoint_results(self) -> None:
+        while True:
+            try:
+                ok, servers, error = self.endpoint_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.endpoint_loading = False
+            if not ok:
+                self.status = f"Endpoint unavailable: {error or 'failed to fetch /servers'}"
+                continue
+            previous_seen = set(self.browser_state.seen_endpoint_keys)
+            self.endpoint_servers = [
+                server
+                for server in servers
+                if is_valid_server_entry(server.server_host, server.server_port)
             ]
+            self.new_endpoint_keys = {
+                server.key
+                for server in self.endpoint_servers
+                if server.key not in previous_seen and not self.exists_in_local_store(server.server_host, server.server_port)
+            }
+            self.browser_state.mark_seen(server.key for server in self.endpoint_servers)
+            self.status = f"Loaded {len(self.endpoint_servers)} servers from endpoint."
 
-        if self.scene == "offline":
-            bottom = height - 96
-            return [
-                Button(pygame.Rect(56, bottom, 180, 54), "Start Server", self.start_server),
-                Button(pygame.Rect(252, bottom, 180, 54), "New Client", lambda: self.start_client(ensure_local_server=True)),
-                Button(pygame.Rect(width - 190, bottom, 134, 54), "Back", self.back_to_main),
-            ]
+    def cleanup_finished(self) -> None:
+        self.client_processes = [proc for proc in self.client_processes if proc.process.poll() is None]
+        if self.server_process and self.server_process.process.poll() is not None:
+            self.server_process = None
 
-        bottom = height - 88
-        right = width - 56
-        return [
-            Button(pygame.Rect(56, bottom, 192, 52), "Direct Connect", self.open_direct_connect_modal),
-            Button(pygame.Rect(264, bottom, 148, 52), "Add Server", self.open_add_modal),
-            Button(pygame.Rect(right - 128, bottom, 128, 52), "Back", self.back_to_main),
-        ]
+    def update_toasts(self) -> None:
+        now = time.time()
+        self.toasts = [toast for toast in self.toasts if now - toast.created_at <= toast.duration]
 
-    def open_online(self) -> None:
-        self.scene = "online"
-        self.context_menu_pos = None
-        self.status = "Double-click a server to connect. Right-click for actions."
-        self.checker.refresh_now(self.store.servers)
+    def push_toast(self, text: str, kind: str = "info") -> None:
+        if not text:
+            return
+        self.toasts.insert(0, LauncherToast(text=text, kind=kind, created_at=time.time()))
+        self.toasts = self.toasts[:3]
 
-    def open_offline(self) -> None:
-        self.scene = "offline"
-        if not self.server_process:
-            self.start_server()
-        if not self.client_processes:
-            self.start_client(ensure_local_server=True)
+    def shutdown(self) -> None:
+        for client in self.client_processes:
+            if client.process.poll() is None:
+                client.process.terminate()
+        if self.server_process and self.server_process.process.poll() is None:
+            self.server_process.process.terminate()
+        pygame.quit()
 
     def back_to_main(self) -> None:
         self.scene = "main"
-        self.context_menu_pos = None
-        self.status = "Choose a mode."
-
-    def exit_app(self) -> None:
-        self.running = False
+        self.context_menu_kind = None
+        self.status = ""
 
     def start_server(self) -> None:
         if self.server_process and self.server_process.process.poll() is None:
@@ -265,31 +361,43 @@ class SkyroomLauncherApp:
         self.server_process = ManagedProcess("server", process)
         self.status = "Local server started."
 
-    def start_client(self, host: str = NETWORK.host, port: int = NETWORK.port, ensure_local_server: bool = False) -> None:
-        if ensure_local_server:
-            if not self.server_process or self.server_process.process.poll() is not None:
-                self.start_server()
+    def start_client(
+        self,
+        host: str = NETWORK.host,
+        port: int = NETWORK.port,
+        server_name: str = "",
+        ensure_local_server: bool = False,
+    ) -> None:
+        if ensure_local_server and (not self.server_process or self.server_process.process.poll() is not None):
+            self.start_server()
         self.client_counter += 1
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["SKYROOM_HOST"] = host
         env["SKYROOM_PORT"] = str(port)
+        if server_name:
+            env["SKYROOM_SERVER_NAME"] = server_name
         process = subprocess.Popen([sys.executable, "client.py"], cwd=PROJECT_ROOT, env=env)
         self.client_processes.append(ManagedProcess(f"client-{self.client_counter}", process))
         self.status = f"Opened client for {host}:{port}."
 
-    def cleanup_finished(self) -> None:
-        self.client_processes = [proc for proc in self.client_processes if proc.process.poll() is None]
-        if self.server_process and self.server_process.process.poll() is not None:
-            self.server_process = None
+    def fetch_endpoint_servers_async(self) -> None:
+        if self.endpoint_loading:
+            return
+        self.endpoint_loading = True
+        threading.Thread(target=self._fetch_endpoint_servers_worker, daemon=True).start()
 
-    def shutdown(self) -> None:
-        for client in self.client_processes:
-            if client.process.poll() is None:
-                client.process.terminate()
-        if self.server_process and self.server_process.process.poll() is None:
-            self.server_process.process.terminate()
-        pygame.quit()
+    def _fetch_endpoint_servers_worker(self) -> None:
+        ok, servers, error = self.endpoint.fetch_servers()
+        self.endpoint_queue.put((ok, servers, error))
+
+    def exists_in_local_store(self, host: str, port: int) -> bool:
+        return any(server.host.strip().lower() == host.strip().lower() and server.port == port for server in self.store.servers)
+
+    def refresh_all_servers(self) -> None:
+        displayed = self.displayed_servers()
+        self.checker.refresh_now([item.server for item in displayed])
+        self.status = f"Refreshing {len(displayed)} visible servers..."
 
     def open_direct_connect_modal(self) -> None:
         self.modal = ModalForm(
@@ -315,9 +423,10 @@ class SkyroomLauncherApp:
         )
 
     def open_edit_modal(self) -> None:
-        selected = self.get_selected_server()
-        if not selected:
+        item = self.get_selected_item()
+        if not item or item.local_index is None:
             return
+        selected = self.store.servers[item.local_index]
         self.modal = ModalForm(
             "Edit Server",
             [
@@ -342,22 +451,28 @@ class SkyroomLauncherApp:
             return
         duplicate = self.find_duplicate_server(server)
         if duplicate:
-            self.set_modal_error(f"That server already exists as {duplicate.name}.")
+            self.set_modal_error(f"That server already exists as {duplicate.server.name}.")
             return
         self.store.add(server)
-        self.selected_server = len(self.store.servers) - 1
-        self.checker.refresh_now(self.store.servers)
         self.modal = None
         self.status = f"Saved {server.name}."
+        self.refresh_all_servers()
 
     def submit_edit_server(self, values: list[str]) -> None:
+        item = self.get_selected_item()
+        if not item or item.local_index is None:
+            return
         server = self.parse_server_values(values)
         if not server:
             return
-        self.store.update(self.selected_server, server)
-        self.checker.refresh_now(self.store.servers)
+        duplicate = self.find_duplicate_server(server, skip_local_index=item.local_index)
+        if duplicate:
+            self.set_modal_error(f"That server already exists as {duplicate.server.name}.")
+            return
+        self.store.update(item.local_index, server)
         self.modal = None
         self.status = f"Updated {server.name}."
+        self.refresh_all_servers()
 
     def parse_server_values(self, values: list[str]) -> Optional[ServerEntry]:
         name, host, port_text = values
@@ -365,6 +480,9 @@ class SkyroomLauncherApp:
         host = host.strip()
         if not host:
             self.set_modal_error("Host is required.")
+            return None
+        if not is_valid_host(host):
+            self.set_modal_error("Enter a valid IPv4 address, localhost, or domain.")
             return None
         try:
             port = int(port_text)
@@ -376,13 +494,13 @@ class SkyroomLauncherApp:
             return None
         return ServerEntry(name=name[:32], host=host[:128], port=port)
 
-    def find_duplicate_server(self, server: ServerEntry, skip_index: Optional[int] = None) -> Optional[ServerEntry]:
+    def find_duplicate_server(self, server: ServerEntry, skip_local_index: Optional[int] = None) -> Optional[DisplayedServer]:
         normalized_host = server.host.strip().lower()
-        for index, existing in enumerate(self.store.servers):
-            if skip_index is not None and index == skip_index:
+        for item in self.displayed_servers():
+            if skip_local_index is not None and item.local_index == skip_local_index:
                 continue
-            if existing.host.strip().lower() == normalized_host and existing.port == server.port:
-                return existing
+            if item.server.host.strip().lower() == normalized_host and item.server.port == server.port:
+                return item
         return None
 
     def set_modal_error(self, text: str) -> None:
@@ -390,34 +508,37 @@ class SkyroomLauncherApp:
             self.modal.error = text
 
     def remove_selected_server(self) -> None:
-        if not self.store.servers:
+        item = self.get_selected_item()
+        if not item or item.local_index is None:
+            self.status = "Only locally saved servers can be removed."
             return
-        removed = self.store.servers[self.selected_server]
-        self.store.remove(self.selected_server)
-        self.selected_server = max(0, min(self.selected_server, len(self.store.servers) - 1))
-        self.checker.refresh_now(self.store.servers)
+        removed = self.store.servers[item.local_index]
+        self.store.remove(item.local_index)
+        self.selected_server = max(0, min(self.selected_server, len(self.displayed_servers()) - 1))
+        self.context_menu_kind = None
         self.status = f"Removed {removed.name}."
-        self.context_menu_pos = None
 
     def connect_selected_server(self) -> None:
-        selected = self.get_selected_server()
-        if selected:
-            self.connect_to_server(selected)
+        item = self.get_selected_item()
+        if item:
+            self.connect_to_server(item.server)
 
     def connect_to_server(self, server: ServerEntry) -> None:
         self.status = f"Checking {server.host}:{server.port}..."
         self.draw()
         result = self.checker.check_once(server)
         if not result.online:
-            self.status = f"{server.name} is offline or unreachable."
+            self.status = ""
+            self.push_toast(f"{server.name} is offline or unreachable.", kind="error")
             return
-        self.start_client(server.host, server.port)
+        self.start_client(server.host, server.port, server_name=result.server_name or server.name)
 
-    def get_selected_server(self) -> Optional[ServerEntry]:
-        if not self.store.servers:
+    def get_selected_item(self) -> Optional[DisplayedServer]:
+        displayed = self.displayed_servers()
+        if not displayed:
             return None
-        self.selected_server = max(0, min(self.selected_server, len(self.store.servers) - 1))
-        return self.store.servers[self.selected_server]
+        self.selected_server = max(0, min(self.selected_server, len(displayed) - 1))
+        return displayed[self.selected_server]
 
     def handle_server_left_click(self, pos: tuple[int, int]) -> None:
         index = self.server_index_at(pos)
@@ -433,19 +554,17 @@ class SkyroomLauncherApp:
 
     def open_context_menu_at(self, pos: tuple[int, int]) -> None:
         index = self.server_index_at(pos)
-        if index is None:
-            self.context_menu_pos = None
-            self.context_menu_index = None
-            return
-        self.selected_server = index
-        self.context_menu_index = index
         self.context_menu_pos = pos
+        self.context_menu_index = index
+        self.context_menu_kind = "server" if index is not None else "global"
+        if index is not None:
+            self.selected_server = index
 
     def handle_context_menu_click(self, pos: tuple[int, int]) -> bool:
         for button in self.context_menu_buttons():
             if button.hit(pos):
                 button.action()
-                self.context_menu_pos = None
+                self.context_menu_kind = None
                 return True
         return False
 
@@ -453,26 +572,48 @@ class SkyroomLauncherApp:
         width, height = self.screen.get_size()
         list_rect = pygame.Rect(56, 150, width - 112, max(220, height - 260))
         row_h = 74
-        for index, _server in enumerate(self.store.servers[: max(0, list_rect.height // row_h)]):
+        for index, _item in enumerate(self.displayed_servers()[: max(0, list_rect.height // row_h)]):
             row = pygame.Rect(list_rect.x + 12, list_rect.y + 12 + index * row_h, list_rect.width - 24, 62)
             if row.collidepoint(pos):
                 return index
         return None
 
     def context_menu_buttons(self) -> list[Button]:
-        if self.context_menu_pos is None or self.context_menu_index is None:
+        if self.context_menu_kind is None or self.context_menu_pos is None:
             return []
         x, y = self.context_menu_pos
         width, height = self.screen.get_size()
-        menu_w = 172
-        menu_h = 138
+        menu_w = 184
         x = min(x, width - menu_w - 14)
-        y = min(y, height - menu_h - 14)
+        if self.context_menu_kind == "global":
+            y = min(y, height - 60 - 14)
+            return [Button(pygame.Rect(x + 10, y + 10, menu_w - 20, 34), "Refresh All", self.refresh_all_servers)]
+        item = self.get_selected_item()
+        if not item:
+            return []
+        y = min(y, height - 138 - 14)
         return [
             Button(pygame.Rect(x + 10, y + 10, menu_w - 20, 34), "Connect", self.connect_selected_server),
-            Button(pygame.Rect(x + 10, y + 52, menu_w - 20, 34), "Edit", self.open_edit_modal),
-            Button(pygame.Rect(x + 10, y + 94, menu_w - 20, 34), "Remove", self.remove_selected_server),
+            Button(pygame.Rect(x + 10, y + 52, menu_w - 20, 34), "Edit", self.open_edit_modal, item.local_index is not None),
+            Button(pygame.Rect(x + 10, y + 94, menu_w - 20, 34), "Remove", self.remove_selected_server, item.local_index is not None),
         ]
+
+    def open_online(self) -> None:
+        self.scene = "online"
+        self.context_menu_kind = None
+        self.status = "Loading servers from endpoint..."
+        self.fetch_endpoint_servers_async()
+        self.refresh_all_servers()
+
+    def open_offline(self) -> None:
+        self.scene = "offline"
+        if not self.server_process:
+            self.start_server()
+        if not self.client_processes:
+            self.start_client(server_name="Local Skyroom", ensure_local_server=True)
+
+    def exit_app(self) -> None:
+        self.running = False
 
     def draw(self) -> None:
         self.draw_background()
@@ -484,6 +625,8 @@ class SkyroomLauncherApp:
             self.draw_online()
         if self.modal:
             self.draw_modal()
+        self.draw_toasts()
+        self.debug_console.draw(self.screen)
         draw_custom_cursor(self.screen, pygame.mouse.get_pos(), self.cloud_phase)
         pygame.display.flip()
 
@@ -498,15 +641,22 @@ class SkyroomLauncherApp:
             cloud_y = spec["y"] + math.sin(self.cloud_phase * 0.6 + spec["phase"]) * spec["wobble"]
             self.draw_cloud(int(offset), int(cloud_y), spec["scale"])
 
+    def draw_cloud(self, x: int, y: int, scale: float) -> None:
+        surface = pygame.Surface((220, 110), pygame.SRCALPHA)
+        cloud_color = (255, 255, 255, 68)
+        for cx, cy, radius in ((58, 58, 34), (96, 42, 42), (136, 54, 38), (170, 60, 26)):
+            pygame.draw.circle(surface, cloud_color, (int(cx * scale), int(cy * scale)), int(radius * scale))
+        self.screen.blit(surface, (x, y))
+
     def draw_main_menu(self) -> None:
         width, height = self.screen.get_size()
         panel = pygame.Rect(width // 2 - 285, height // 2 - 220, 570, 440)
         self.draw_shadowed_panel(panel, 232)
         title = self.font_title.render("Skyroom", True, PALETTE["text"])
-        subtitle = self.font_body.render("Soft rooms, local play, and saved servers", True, PALETTE["muted"])
+        subtitle = self.font_body.render("Jews rule. Crème de la crème", True, PALETTE["muted"])
         self.screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 72)))
-        self.screen.blit(subtitle, subtitle.get_rect(center=(panel.centerx, panel.y + 120)))
-        for button in self.current_buttons():
+        self.screen.blit(subtitle, subtitle.get_rect(center=(panel.centerx, panel.y + 118)))
+        for button in self.main_menu_buttons():
             self.draw_glossy_button(button)
         self.draw_status_line(panel.bottom - 34)
 
@@ -515,9 +665,9 @@ class SkyroomLauncherApp:
         header = pygame.Rect(42, 36, width - 84, 112)
         self.draw_shadowed_panel(header, 224)
         title = self.font_heading.render("Offline", True, PALETTE["text"])
-        hint = self.font_body.render("Local server and local client windows use the existing Skyroom game.", True, PALETTE["muted"])
+        subtitle = self.font_body.render("Jews rule", True, PALETTE["muted"])
         self.screen.blit(title, (header.x + 26, header.y + 22))
-        self.screen.blit(hint, (header.x + 26, header.y + 66))
+        self.screen.blit(subtitle, (header.x + 26, header.y + 62))
 
         panel = pygame.Rect(56, 180, width - 112, max(230, height - 310))
         self.draw_shadowed_panel(panel, 218)
@@ -525,7 +675,7 @@ class SkyroomLauncherApp:
             f"Server: {'running' if self.server_process else 'stopped'}",
             f"Client windows: {len(self.client_processes)} active",
             "Offline starts a local server and opens the client against 127.0.0.1.",
-            "Use New Client when you want another local player window.",
+            "Use New Client or press X for another local player window.",
         ]
         for index, line in enumerate(lines):
             color = PALETTE["text"] if index < 2 else PALETTE["muted"]
@@ -542,17 +692,20 @@ class SkyroomLauncherApp:
         header = pygame.Rect(42, 34, width - 84, 96)
         self.draw_shadowed_panel(header, 224)
         title = self.font_heading.render("Online", True, PALETTE["text"])
-        subtitle = self.font_body.render("Saved servers, direct connect, and local ping checks", True, PALETTE["muted"])
+        subtitle = self.font_body.render("Jews rule", True, PALETTE["muted"])
         self.screen.blit(title, (header.x + 26, header.y + 20))
-        self.screen.blit(subtitle, (header.x + 26, header.y + 58))
+        self.screen.blit(subtitle, (header.x + 26, header.y + 56))
 
         list_rect = pygame.Rect(56, 150, width - 112, max(220, height - 260))
         self.draw_shadowed_panel(list_rect, 216)
-        if not self.store.servers:
-            empty = self.font_body.render("No saved servers yet.", True, PALETTE["muted"])
-            self.screen.blit(empty, empty.get_rect(center=list_rect.center))
+        displayed = self.displayed_servers()
+        if not displayed:
+            empty = self.font_body.render("No servers yet.", True, PALETTE["muted"])
+            helper = self.font_small.render("Add one or use Direct Connect.", True, PALETTE["muted"])
+            self.screen.blit(empty, empty.get_rect(center=(list_rect.centerx, list_rect.centery - 12)))
+            self.screen.blit(helper, helper.get_rect(center=(list_rect.centerx, list_rect.centery + 18)))
         else:
-            self.draw_server_rows(list_rect)
+            self.draw_server_rows(list_rect, displayed)
 
         for button in self.current_buttons():
             self.draw_glossy_button(button)
@@ -560,30 +713,36 @@ class SkyroomLauncherApp:
         self.draw_hover_tooltip()
         self.draw_status_line(height - 26)
 
-    def draw_server_rows(self, list_rect: pygame.Rect) -> None:
+    def draw_server_rows(self, list_rect: pygame.Rect, displayed: list[DisplayedServer]) -> None:
         row_h = 74
         max_rows = max(0, list_rect.height // row_h)
-        for index, server in enumerate(self.store.servers[:max_rows]):
+        for index, item in enumerate(displayed[:max_rows]):
             row = pygame.Rect(list_rect.x + 12, list_rect.y + 12 + index * row_h, list_rect.width - 24, 62)
             selected = index == self.selected_server
             fill = (255, 255, 255, 235) if selected else (248, 252, 255, 200)
             pygame.draw.rect(self.screen, fill, row, border_radius=22)
             pygame.draw.rect(self.screen, add_alpha(PALETTE["outline"], 240), row, width=2, border_radius=22)
-            if selected:
-                shine = pygame.Surface(row.size, pygame.SRCALPHA)
-                pygame.draw.ellipse(shine, (255, 255, 255, 80), (-20, -24, row.width * 0.62, row.height * 0.92))
-                self.screen.blit(shine, row.topleft)
 
-            name = self.truncate(server.name, self.font_ui, row.width - 230)
-            host = self.truncate(f"{server.host}:{server.port}", self.font_small, row.width - 230)
-            name_surface = self.font_ui.render(name, True, PALETTE["text"])
-            host_surface = self.font_small.render(host, True, PALETTE["muted"])
-            self.screen.blit(name_surface, (row.x + 22, row.y + 11))
-            self.screen.blit(host_surface, (row.x + 23, row.y + 39))
+            dot_offset = 0
+            if item.is_new:
+                marker = pygame.Rect(row.x + 14, row.y + 15, 8, row.height - 30)
+                pygame.draw.rect(self.screen, (250, 232, 156), marker, border_radius=4)
+                pygame.draw.rect(self.screen, (255, 248, 220), marker, width=1, border_radius=4)
+                dot_offset = 14
+
+            health = self.checker.get(item.server)
+            name = self.truncate(health.server_name or item.server.name, self.font_ui, row.width - 290)
+            host = self.truncate(f"{item.server.host}:{item.server.port}", self.font_small, row.width - 290)
+            self.screen.blit(self.font_ui.render(name, True, PALETTE["text"]), (row.x + 22 + dot_offset, row.y + 10))
+            self.screen.blit(self.font_small.render(host, True, PALETTE["muted"]), (row.x + 22 + dot_offset, row.y + 39))
+
+            if health.online_count is not None:
+                online_label = self.font_small.render(f"{health.online_count} online", True, PALETTE["muted"])
+                self.screen.blit(online_label, online_label.get_rect(right=row.right - 96, centery=row.centery))
 
             signal_rect = pygame.Rect(row.right - 82, row.y + 17, 46, 32)
-            self.signal_rects.append((signal_rect, server))
-            self.draw_signal_indicator(signal_rect, self.checker.get(server))
+            self.signal_rects.append((signal_rect, item))
+            self.draw_signal_indicator(signal_rect, health)
 
     def draw_signal_indicator(self, rect: pygame.Rect, result) -> None:
         bars = result.bars
@@ -601,11 +760,16 @@ class SkyroomLauncherApp:
 
     def draw_hover_tooltip(self) -> None:
         mouse = pygame.mouse.get_pos()
-        for rect, server in self.signal_rects:
+        for rect, item in self.signal_rects:
             if not rect.collidepoint(mouse):
                 continue
-            result = self.checker.get(server)
-            text = f"Ping: {result.ping_ms} ms" if result.online and result.ping_ms is not None else "Offline"
+            result = self.checker.get(item.server)
+            if result.online and result.ping_ms is not None:
+                text = f"Ping: {result.ping_ms} ms"
+                if result.online_count is not None:
+                    text += f" | Online: {result.online_count}"
+            else:
+                text = "Offline"
             label = self.font_small.render(text, True, PALETTE["text"])
             tooltip = label.get_rect()
             tooltip.width += 30
@@ -622,111 +786,180 @@ class SkyroomLauncherApp:
 
     def draw_context_menu(self) -> None:
         buttons = self.context_menu_buttons()
-        if not buttons:
+        if not buttons or self.context_menu_pos is None:
             return
-        bounds = buttons[0].rect.unionall([button.rect for button in buttons[1:]]).inflate(20, 20)
-        shadow = pygame.Surface((bounds.width + 16, bounds.height + 16), pygame.SRCALPHA)
-        pygame.draw.rect(shadow, (111, 152, 211, 42), (8, 8, bounds.width, bounds.height), border_radius=18)
-        self.screen.blit(shadow, (bounds.x - 8, bounds.y - 4))
-        pygame.draw.rect(self.screen, (255, 255, 255, 240), bounds, border_radius=18)
-        pygame.draw.rect(self.screen, add_alpha(PALETTE["outline"], 245), bounds, width=2, border_radius=18)
+        x, y = self.context_menu_pos
+        width = max(button.rect.width for button in buttons) + 20
+        height = (buttons[-1].rect.bottom - buttons[0].rect.y) + 20
+        panel = pygame.Rect(buttons[0].rect.x - 10, buttons[0].rect.y - 10, width, height)
+        self.draw_shadowed_panel(panel, 238, radius=18, shadow_alpha=34)
         for button in buttons:
             self.draw_context_button(button)
 
     def draw_context_button(self, button: Button) -> None:
-        hover = button.rect.collidepoint(pygame.mouse.get_pos())
-        fill = (241, 249, 255) if hover else (255, 255, 255)
+        mouse = pygame.mouse.get_pos()
+        hovered = button.enabled and button.rect.collidepoint(mouse)
+        if button.enabled:
+            fill = (247, 251, 255, 242) if hovered else (242, 248, 255, 226)
+            text_color = PALETTE["text"]
+        else:
+            fill = (239, 243, 249, 150)
+            text_color = PALETTE["muted"]
         pygame.draw.rect(self.screen, fill, button.rect, border_radius=14)
-        label = self.font_small.render(button.label, True, PALETTE["text"])
+        pygame.draw.rect(self.screen, add_alpha(PALETTE["outline"], 220), button.rect, width=1, border_radius=14)
+        label = self.font_small.render(button.label, True, text_color)
         self.screen.blit(label, label.get_rect(center=button.rect.center))
 
     def draw_modal(self) -> None:
         if not self.modal:
             return
         overlay = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
-        overlay.fill((236, 244, 255, 126))
+        overlay.fill((27, 40, 68, 68))
         self.screen.blit(overlay, (0, 0))
+
         width, height = self.screen.get_size()
-        modal_width = min(width - 96, 680)
-        modal_rect = pygame.Rect(width // 2 - modal_width // 2, height // 2 - 160, modal_width, 320)
-        self.draw_shadowed_panel(modal_rect, 244)
+        field_count = len(self.modal.fields)
+        panel_h = 248 if field_count <= 2 else 296
+        panel = pygame.Rect(width // 2 - 248, height // 2 - panel_h // 2, 496, panel_h)
+        self.draw_shadowed_panel(panel, 244, radius=28, shadow_alpha=42)
+
         title = self.font_heading.render(self.modal.title, True, PALETTE["text"])
-        self.screen.blit(title, title.get_rect(center=(modal_rect.centerx, modal_rect.y + 44)))
+        self.screen.blit(title, (panel.x + 28, panel.y + 22))
 
-        field_margin = 56
-        field_gap = 24
-        inner_width = modal_rect.width - field_margin * 2
-        port_width = 168
-        host_width = inner_width - field_gap - port_width
-        if len(self.modal.fields) == 3:
-            name_field, host_field, port_field = self.modal.fields
-            self.draw_modal_field(name_field, pygame.Rect(modal_rect.x + field_margin, modal_rect.y + 108, inner_width, 48))
-            self.draw_modal_field(host_field, pygame.Rect(modal_rect.x + field_margin, modal_rect.y + 184, host_width, 48))
-            self.draw_modal_field(port_field, pygame.Rect(modal_rect.x + field_margin + host_width + field_gap, modal_rect.y + 184, port_width, 48))
-        elif len(self.modal.fields) == 2:
-            host_field, port_field = self.modal.fields
-            self.draw_modal_field(host_field, pygame.Rect(modal_rect.x + field_margin, modal_rect.y + 126, host_width, 48))
-            self.draw_modal_field(port_field, pygame.Rect(modal_rect.x + field_margin + host_width + field_gap, modal_rect.y + 126, port_width, 48))
-        else:
-            field_y = modal_rect.y + 92
-            for field in self.modal.fields:
-                self.draw_modal_field(field, pygame.Rect(modal_rect.x + field_margin, field_y + 24, inner_width, 48))
-                field_y += 72
+        if field_count == 2:
+            host_rect = pygame.Rect(panel.x + 28, panel.y + 98, 316, 54)
+            port_rect = pygame.Rect(host_rect.right + 14, host_rect.y, panel.right - host_rect.right - 42, 54)
+            self.draw_modal_field(self.modal.fields[0], host_rect)
+            self.draw_modal_field(self.modal.fields[1], port_rect)
+        elif field_count >= 3:
+            self.draw_modal_field(self.modal.fields[0], pygame.Rect(panel.x + 28, panel.y + 78, panel.width - 56, 54))
+            host_rect = pygame.Rect(panel.x + 28, panel.y + 150, 316, 54)
+            port_rect = pygame.Rect(host_rect.right + 14, host_rect.y, panel.right - host_rect.right - 42, 54)
+            self.draw_modal_field(self.modal.fields[1], host_rect)
+            self.draw_modal_field(self.modal.fields[2], port_rect)
 
+        error_y = panel.bottom - 94
         if self.modal.error:
-            error = self.font_small.render(self.modal.error, True, (188, 100, 126))
-            self.screen.blit(error, error.get_rect(center=(modal_rect.centerx, modal_rect.bottom - 86)))
+            error = self.font_small.render(self.modal.error, True, (183, 95, 116))
+            self.screen.blit(error, (panel.x + 30, error_y))
 
-        self.modal.submit_rect = pygame.Rect(modal_rect.centerx - 170, modal_rect.bottom - 62, 158, 48)
-        self.modal.cancel_rect = pygame.Rect(modal_rect.centerx + 12, modal_rect.bottom - 62, 158, 48)
-        self.draw_glossy_button(Button(self.modal.submit_rect, self.modal.submit_label, lambda: None))
+        self.modal.cancel_rect = pygame.Rect(panel.right - 160, panel.bottom - 66, 108, 42)
+        self.modal.submit_rect = pygame.Rect(panel.right - 278, panel.bottom - 66, 108, 42)
+        self.draw_glossy_button(Button(self.modal.submit_rect, self.modal.submit_label, self.modal.submit))
         self.draw_glossy_button(Button(self.modal.cancel_rect, "Cancel", lambda: None))
 
     def draw_modal_field(self, field: TextInput, rect: pygame.Rect) -> None:
-        label = self.font_small.render(field.label, True, PALETTE["muted"])
-        self.screen.blit(label, (rect.x + 2, rect.y - 22))
         field.rect = rect
-        fill = PALETTE["panel_soft"] if field.active else (250, 253, 255)
-        pygame.draw.rect(self.screen, fill, field.rect, border_radius=18)
-        outline = PALETTE["primary"] if field.active else PALETTE["outline"]
-        pygame.draw.rect(self.screen, outline, field.rect, width=2, border_radius=18)
-        value = field.value or field.placeholder
-        color = PALETTE["text"] if field.value else (155, 174, 204)
-        rendered = self.font_body.render(self.truncate(value, self.font_body, field.rect.width - 26), True, color)
-        if not field.value:
-            rendered.set_alpha(150)
-        self.screen.blit(rendered, (field.rect.x + 14, field.rect.y + 12))
+        label = self.font_small.render(field.label, True, PALETTE["muted"])
+        self.screen.blit(label, (rect.x + 4, rect.y - 22))
+
+        surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+        base_fill = (255, 255, 255, 242) if field.active else (249, 252, 255, 214)
+        pygame.draw.rect(surface, base_fill, surface.get_rect(), border_radius=18)
+        pygame.draw.rect(
+            surface,
+            add_alpha(PALETTE["accent"], 240) if field.active else add_alpha(PALETTE["outline"], 220),
+            surface.get_rect(),
+            width=2,
+            border_radius=18,
+        )
+        self.screen.blit(surface, rect.topleft)
+
+        text_value = field.value or field.placeholder
+        text_color = PALETTE["text"] if field.value else (155, 168, 188)
+        rendered = self.font_body.render(text_value, True, text_color)
+        self.screen.blit(rendered, rendered.get_rect(midleft=(rect.x + 18, rect.centery)))
 
     def draw_status_line(self, y: int) -> None:
-        rendered = self.font_small.render(self.status, True, PALETTE["muted"])
-        self.screen.blit(rendered, rendered.get_rect(center=(self.screen.get_width() // 2, y)))
+        if not self.status:
+            return
+        width = self.screen.get_width() - 112
+        status = self.truncate(self.status, self.font_small, width)
+        label = self.font_small.render(status, True, PALETTE["muted"])
+        self.screen.blit(label, (56, y))
 
-    def draw_shadowed_panel(self, rect: pygame.Rect, alpha: int) -> None:
-        shadow = pygame.Surface((rect.width + 24, rect.height + 24), pygame.SRCALPHA)
-        pygame.draw.rect(shadow, (111, 152, 211, 42), (12, 12, rect.width, rect.height), border_radius=28)
-        self.screen.blit(shadow, (rect.x - 12, rect.y - 4))
-        pygame.draw.rect(self.screen, add_alpha(PALETTE["panel"], alpha), rect, border_radius=28)
-        pygame.draw.rect(self.screen, add_alpha(PALETTE["outline"], alpha), rect, width=2, border_radius=28)
+    def draw_toasts(self) -> None:
+        if not self.toasts:
+            return
+        right = self.screen.get_width() - 24
+        top = 24
+        for index, toast in enumerate(self.toasts[:3]):
+            age = time.time() - toast.created_at
+            fade = 1.0 if age < toast.duration - 0.45 else max(0.0, (toast.duration - age) / 0.45)
+            width = 360
+            height = 64
+            rect = pygame.Rect(right - width, top + index * 76, width, height)
+            self.draw_toast(rect, toast, fade)
+
+    def draw_toast(self, rect: pygame.Rect, toast: LauncherToast, fade: float) -> None:
+        if toast.kind == "error":
+            fill = (255, 237, 241, int(232 * fade))
+            outline = (239, 192, 201, int(246 * fade))
+            icon_fill = (235, 162, 176, int(230 * fade))
+            icon_fg = (255, 250, 252, int(250 * fade))
+            text_color = (126, 85, 100)
+        else:
+            fill = (246, 250, 255, int(228 * fade))
+            outline = (214, 228, 244, int(240 * fade))
+            icon_fill = (172, 203, 235, int(226 * fade))
+            icon_fg = (255, 255, 255, int(248 * fade))
+            text_color = PALETTE["text"]
+
+        shadow = pygame.Surface((rect.width + 18, rect.height + 18), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (100, 122, 158, int(24 * fade)), (9, 10, rect.width, rect.height), border_radius=22)
+        self.screen.blit(shadow, (rect.x - 9, rect.y - 6))
+
+        card = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(card, fill, card.get_rect(), border_radius=22)
+        pygame.draw.rect(card, outline, card.get_rect(), width=2, border_radius=22)
+        self.screen.blit(card, rect.topleft)
+
+        icon_center = (rect.x + 34, rect.centery)
+        pygame.draw.circle(self.screen, icon_fill, icon_center, 14)
+        pygame.draw.circle(self.screen, outline, icon_center, 14, width=1)
+        pygame.draw.line(self.screen, icon_fg, (icon_center[0] - 4, icon_center[1] - 4), (icon_center[0] + 4, icon_center[1] + 4), 2)
+        pygame.draw.line(self.screen, icon_fg, (icon_center[0] + 4, icon_center[1] - 4), (icon_center[0] - 4, icon_center[1] + 4), 2)
+
+        text = self.truncate(toast.text, self.font_small, rect.width - 74)
+        label = self.font_small.render(text, True, text_color)
+        self.screen.blit(label, label.get_rect(midleft=(rect.x + 58, rect.centery)))
+
+    def draw_shadowed_panel(
+        self,
+        rect: pygame.Rect,
+        fill_alpha: int,
+        radius: int = 30,
+        shadow_alpha: int = 28,
+    ) -> None:
+        shadow = pygame.Surface((rect.width + 26, rect.height + 26), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (114, 146, 203, shadow_alpha), (12, 14, rect.width, rect.height), border_radius=radius + 10)
+        self.screen.blit(shadow, (rect.x - 12, rect.y - 10))
+
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(panel, (255, 255, 255, fill_alpha), panel.get_rect(), border_radius=radius)
+        pygame.draw.rect(panel, add_alpha(PALETTE["outline"], 230), panel.get_rect(), width=2, border_radius=radius)
+        self.screen.blit(panel, rect.topleft)
 
     def draw_glossy_button(self, button: Button) -> None:
-        mouse_over = button.rect.collidepoint(pygame.mouse.get_pos()) and button.enabled
-        base = PALETTE["primary"] if button.enabled else (194, 208, 226)
-        fill = blend(base, (255, 255, 255), 0.13 if mouse_over else 0.0)
-        pygame.draw.rect(self.screen, fill, button.rect, border_radius=23)
-        pygame.draw.rect(self.screen, add_alpha((255, 255, 255), 165), button.rect, width=2, border_radius=23)
-        gloss = pygame.Surface(button.rect.size, pygame.SRCALPHA)
-        pygame.draw.ellipse(gloss, (255, 255, 255, 92), (-8, -14, button.rect.width * 0.98, button.rect.height * 0.76))
-        self.screen.blit(gloss, button.rect.topleft)
-        label_color = (255, 255, 255) if button.enabled else (238, 244, 252)
-        label = self.font_body.render(button.label, True, label_color)
-        self.screen.blit(label, label.get_rect(center=button.rect.center))
+        mouse = pygame.mouse.get_pos()
+        hovered = button.enabled and button.rect.collidepoint(mouse)
+        pressed = hovered and pygame.mouse.get_pressed()[0]
+        if button.enabled:
+            fill = PALETTE["accent"] if hovered else PALETTE["panel"]
+            text_color = PALETTE["text"]
+        else:
+            fill = (225, 232, 242)
+            text_color = PALETTE["muted"]
 
-    def draw_cloud(self, x: int, y: int, scale: float) -> None:
-        surface = pygame.Surface((220, 110), pygame.SRCALPHA)
-        cloud_color = (255, 255, 255, 68)
-        for cx, cy, radius in ((58, 58, 34), (96, 42, 42), (136, 54, 38), (170, 60, 26)):
-            pygame.draw.circle(surface, cloud_color, (int(cx * scale), int(cy * scale)), int(radius * scale))
-        self.screen.blit(surface, (x, y))
+        surface = pygame.Surface(button.rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(surface, add_alpha(fill, 236), surface.get_rect(), border_radius=20)
+        pygame.draw.rect(surface, add_alpha(PALETTE["outline"], 240), surface.get_rect(), width=2, border_radius=20)
+        if pressed:
+            pygame.draw.rect(surface, (255, 255, 255, 18), surface.get_rect(), border_radius=20)
+        self.screen.blit(surface, button.rect.topleft)
+
+        label = self.font_body.render(button.label, True, text_color)
+        self.screen.blit(label, label.get_rect(center=button.rect.center))
 
     @staticmethod
     def truncate(text: str, font: pygame.font.Font, max_width: int) -> str:

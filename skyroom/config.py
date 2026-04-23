@@ -2,6 +2,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except OSError:
+        return
+
+
+_load_env_file(Path(__file__).resolve().parents[1] / ".env")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -41,6 +59,21 @@ class ClientConfig:
     move_send_interval: float = _env_float("SKYROOM_MOVE_SEND_INTERVAL", 0.04)
 
 
+@dataclass(frozen=True)
+class ServiceConfig:
+    server_name: str = os.getenv("SKYROOM_SERVER_NAME", "Local Skyroom")
+    public_host: str = os.getenv("SKYROOM_PUBLIC_HOST", os.getenv("SKYROOM_HOST", "127.0.0.1"))
+    public_port: int = _env_int("SKYROOM_PUBLIC_PORT", _env_int("SKYROOM_PORT", 8765))
+
+
+@dataclass(frozen=True)
+class EndpointConfig:
+    base_url: str = os.getenv("SKYROOM_ENDPOINT_BASE_URL", "https://api.skyroom1337.workers.dev").rstrip("/")
+    timeout: float = _env_float("SKYROOM_ENDPOINT_TIMEOUT", 5.0)
+
+
 NETWORK = NetworkConfig()
 SERVER = ServerConfig()
 CLIENT = ClientConfig()
+SERVICE = ServiceConfig()
+ENDPOINT = EndpointConfig()

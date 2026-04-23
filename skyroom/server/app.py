@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import random
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from ..config import NETWORK, SERVER
+from ..config import NETWORK, SERVER, SERVICE
 from ..models import PlayerState, color_from_name, facing_from_vector, facing_towards, normalize
-from ..protocol import ProtocolError, read_message, send_message
+from ..protocol import ProtocolError, decode_message, read_message, send_message
 from ..world import MapLayout
 
 
@@ -51,7 +52,13 @@ class GameServer:
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         player_id = ""
         try:
-            hello = await read_message(reader)
+            raw_line = await reader.readline()
+            if not raw_line:
+                raise ConnectionError("Socket closed")
+            if raw_line.startswith(b"GET /health "):
+                await self.respond_health(writer)
+                return
+            hello = decode_message(raw_line)
             if hello.get("type") == "ping":
                 await send_message(writer, {"type": "pong", "server": "skyroom"})
                 return
@@ -97,6 +104,24 @@ class GameServer:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
+
+    async def respond_health(self, writer: asyncio.StreamWriter) -> None:
+        payload = {
+            "status": True,
+            "server_name": SERVICE.server_name,
+            "server_host": SERVICE.public_host,
+            "server_port": SERVICE.public_port,
+            "online": len(self.sessions),
+        }
+        body = json.dumps(payload).encode("utf-8")
+        header = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8")
+        writer.write(header + body)
+        await writer.drain()
 
     def create_player(self, name: str) -> PlayerState:
         x, y = self.map_layout.choose_spawn(session.player for session in self.sessions.values())

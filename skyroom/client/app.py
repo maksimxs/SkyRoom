@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
+import threading
 import time
 from typing import Any, Dict, Optional
 
 import pygame
 
-from ..config import CLIENT, NETWORK, SERVER
+from ..config import CLIENT, ENDPOINT, NETWORK, SERVER
 from ..models import clamp, facing_from_vector, lerp
 from .chrome import AudioController, create_window_icon
+from .debug import DebugConsole
+from .endpoint import EndpointClient
 from .network import ServerConnection
 from .rendering import SceneRenderer, pick_font_name
 from .state import PlayerView, Toast
@@ -32,11 +36,13 @@ class SkyroomClientApp:
         self.font_ui = pygame.font.SysFont(self.font_name, 28)
         self.font_title = pygame.font.SysFont(self.font_name, 52, bold=True)
         self.font_emoji = pygame.font.SysFont("Segoe UI Emoji", 28)
+        self.font_console = pygame.font.SysFont(self.font_name, 18)
         self.running = True
         self.scene = "login"
         self.login_name = ""
         self.server_host = host
         self.server_port = port
+        self.server_name = os.getenv("SKYROOM_SERVER_NAME", "")
         self.connection: Optional[ServerConnection] = None
         self.connection_state = "offline"
         self.connection_message = ""
@@ -50,6 +56,8 @@ class SkyroomClientApp:
         self.chat_input = ""
         self.toasts: list[Toast] = []
         self.last_mouse_facing = "down"
+        self.player_join_reported = False
+        self.active_handshake_pairs: set[tuple[str, str]] = set()
         self.cloud_phase = 0.0
         self.mouse_walk_active = False
         self.last_mouse_walk_sent_at = 0.0
@@ -69,6 +77,8 @@ class SkyroomClientApp:
         ]
         self.audio = AudioController()
         self.audio.set_scene("login")
+        self.debug_console = DebugConsole()
+        self.endpoint = EndpointClient(base_url=ENDPOINT.base_url, timeout=ENDPOINT.timeout, logger=self.debug_console.log)
         self.renderer = SceneRenderer(self)
 
     def run(self) -> None:
@@ -89,6 +99,8 @@ class SkyroomClientApp:
             if event.type == pygame.VIDEORESIZE:
                 self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
                 continue
+            if self.debug_console.handle_event(event, self.screen.get_size()):
+                continue
             if self.scene == "login":
                 self.handle_login_event(event)
             else:
@@ -96,6 +108,9 @@ class SkyroomClientApp:
 
     def handle_login_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_d and (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                self.debug_console.toggle()
+                return
             if event.key == pygame.K_RETURN:
                 self.try_connect()
             elif event.key == pygame.K_BACKSPACE:
@@ -108,6 +123,9 @@ class SkyroomClientApp:
 
     def handle_world_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_d and (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                self.debug_console.toggle()
+                return
             if self.chat_mode:
                 if event.key == pygame.K_RETURN:
                     text = self.chat_input.strip()
@@ -159,10 +177,12 @@ class SkyroomClientApp:
         self.self_id = None
         self.map_data = None
         self.players.clear()
+        self.active_handshake_pairs.clear()
         self.camera_x = 0.0
         self.camera_y = 0.0
         self.last_move_payload = (999.0, 999.0)
-        self.connection = ServerConnection(self.server_host, self.server_port, name)
+        self.player_join_reported = False
+        self.connection = ServerConnection(self.server_host, self.server_port, name, logger=self.debug_console.log)
         self.connection.start()
         self.connection_state = "connecting"
         self.connection_message = f"Connecting to {self.server_host}:{self.server_port}"
@@ -178,6 +198,7 @@ class SkyroomClientApp:
                 if state == "error":
                     self.connection_message = message.get("message", "Connection error")
                     self.push_toast(self.connection_message)
+                    self.debug_console.log("SOCKET", self.connection_message)
                 else:
                     self.connection_message = "Connected"
             elif message_type == "welcome":
@@ -187,16 +208,21 @@ class SkyroomClientApp:
                 self.connection_state = "online"
                 self.connection_message = f"{self.server_host}:{self.server_port}"
                 self.audio.set_scene("world")
+                self.active_handshake_pairs.clear()
             elif message_type == "snapshot":
                 self.apply_snapshot(message)
+                self.maybe_report_player_join()
             elif message_type == "system":
                 self.push_toast(message.get("message", ""))
 
     def apply_snapshot(self, snapshot: dict[str, Any]) -> None:
+        seen_handshakes: set[tuple[str, str]] = set()
+        logged_handshakes: set[tuple[str, str]] = set()
         incoming_ids: set[str] = set()
         for payload in snapshot.get("players", []):
             player_id = payload["id"]
             incoming_ids.add(player_id)
+            previous = self.players.get(player_id)
             if player_id not in self.players:
                 self.players[player_id] = PlayerView(
                     player_id=player_id,
@@ -218,11 +244,18 @@ class SkyroomClientApp:
                     display_x=float(payload["x"]),
                     display_y=float(payload["y"]),
                 )
+                previous = None
+            self.log_snapshot_event(previous, payload, logged_handshakes)
             self.players[player_id].absorb(payload)
+            if payload.get("handshake_active") and payload.get("handshake_partner_id"):
+                pair = tuple(sorted((player_id, str(payload.get("handshake_partner_id", "")))))
+                if pair[0] and pair[1]:
+                    seen_handshakes.add(pair)
 
         for player_id in list(self.players):
             if player_id not in incoming_ids:
                 self.players.pop(player_id, None)
+        self.active_handshake_pairs = seen_handshakes
 
     def update(self, dt: float) -> None:
         for toast in list(self.toasts):
@@ -312,6 +345,80 @@ class SkyroomClientApp:
     def push_toast(self, text: str) -> None:
         if text:
             self.toasts.insert(0, Toast(text=text, created_at=time.time()))
+
+    def maybe_report_player_join(self) -> None:
+        if self.player_join_reported or not self.self_id:
+            return
+        local_player = self.players.get(self.self_id)
+        if not local_player:
+            return
+        self.player_join_reported = True
+        online_count = max(1, len(self.players))
+        self.debug_console.log("ENDPOINT", f"queue /player-join online={online_count}")
+        threading.Thread(
+            target=self._send_player_join,
+            args=(local_player.name, online_count),
+            daemon=True,
+        ).start()
+
+    def _send_player_join(self, nick: str, online_count: int) -> None:
+        ok, error = self.endpoint.post_player_join(
+            nick=nick,
+            server_name=self.server_name or self.server_host,
+            server_host=self.server_host,
+            server_port=self.server_port,
+            online=online_count,
+        )
+        if not ok and error:
+            self.debug_console.log("ENDPOINT", f"/player-join failed {error}")
+
+    def log_snapshot_event(
+        self,
+        previous: Optional[PlayerView],
+        payload: dict[str, Any],
+        logged_handshakes: set[tuple[str, str]],
+    ) -> None:
+        name = str(payload.get("name", "Player")).strip() or "Player"
+        chat_text = str(payload.get("chat_text", "")).strip()
+        if chat_text and (previous is None or previous.chat_text != chat_text):
+            self.log_socket_snapshot_event(
+                {
+                    "type": "snapshot",
+                    "event": "chat",
+                    "player": name,
+                    "text": chat_text[:72],
+                }
+            )
+
+        glow_active = bool(payload.get("glow_active", False))
+        if glow_active and (previous is None or not previous.glow_active):
+            self.log_socket_snapshot_event(
+                {
+                    "type": "snapshot",
+                    "event": "glow",
+                    "player": name,
+                    "glow_active": True,
+                }
+            )
+
+        handshake_active = bool(payload.get("handshake_active", False))
+        partner_id = str(payload.get("handshake_partner_id", "") or "")
+        if handshake_active and partner_id:
+            pair = tuple(sorted((str(payload.get("id", "")), partner_id)))
+            if pair not in self.active_handshake_pairs and pair not in logged_handshakes:
+                partner_name = self.players.get(partner_id).name if partner_id in self.players else "someone"
+                self.log_socket_snapshot_event(
+                    {
+                        "type": "snapshot",
+                        "event": "handshake",
+                        "player": name,
+                        "partner": partner_name,
+                    }
+                )
+                logged_handshakes.add(pair)
+
+    def log_socket_snapshot_event(self, payload: dict[str, Any]) -> None:
+        self.debug_console.log("SOCKET", f"RESPONSE {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}")
 
     def login_button_rect(self) -> pygame.Rect:
         width, height = self.screen.get_size()

@@ -8,9 +8,9 @@ It does not depend on `pygame`.
 
 - Runs the multiplayer Skyroom server
 - Responds to lightweight `ping` checks from the client
-- Optionally announces itself to an external registry endpoint on startup
-- Optionally sends periodic heartbeat updates while running
-- Optionally sends an offline notification on shutdown
+- Exposes `GET /health` on the same public game port
+- Calls the external endpoint `POST /check-up` on startup
+- Can call `POST /check-up` again after successful player joins
 
 ## Important note about GitHub Pages
 
@@ -23,13 +23,13 @@ That means auto-registering new servers into a GitHub Pages server list requires
 - a serverless function
 - a GitHub Action trigger that updates JSON in the repo
 
-This package is prepared for that future step via `SKYROOM_REGISTRY_URL`.
+This package is prepared for that future step via `SKYROOM_ENDPOINT_BASE_URL`.
 
 ## Files
 
 - `server.py` - entry point
 - `app.py` - async game server and lifecycle
-- `registry.py` - remote server announce / heartbeat / unregister
+- `endpoint.py` - `/check-up` integration
 - `config.py` - env-based config
 - `models.py`, `world.py`, `protocol.py` - server core
 - `requirements.txt` - no third-party runtime dependency
@@ -50,29 +50,33 @@ Core server settings:
 - `SKYROOM_TICK_RATE`
 - `SKYROOM_PLAYER_SPEED`
 
-Remote publishing settings:
+Remote endpoint settings:
 
 - `SKYROOM_SERVER_NAME`
 - `SKYROOM_PUBLIC_HOST`
 - `SKYROOM_PUBLIC_PORT`
-- `SKYROOM_REGISTRY_URL`
-- `SKYROOM_REGISTRY_SHARED_SECRET`
-- `SKYROOM_REGISTRY_HEARTBEAT`
+- `SKYROOM_ENDPOINT_BASE_URL`
 
-## Registry payload
-
-When `SKYROOM_REGISTRY_URL` is set, the server sends JSON like:
+## /health response
 
 ```json
 {
-  "game": "skyroom",
-  "name": "My Skyroom EU",
-  "host": "203.0.113.20",
-  "port": 8765,
-  "status": "online",
-  "secret": "optional-shared-secret",
-  "timestamp": 1735689600.0
+  "status": true,
+  "server_name": "My Skyroom Remote",
+  "server_host": "203.0.113.20",
+  "server_port": 8765,
+  "online": 3
 }
 ```
 
-The same shape is used for heartbeat and shutdown, with `status` set to `"heartbeat"` or `"offline"`.
+## /check-up payload
+
+When `SKYROOM_ENDPOINT_BASE_URL` is set, the server sends JSON like:
+
+```json
+{
+  "server_name": "My Skyroom Remote",
+  "server_host": "203.0.113.20",
+  "server_port": 8765
+}
+```

@@ -23,6 +23,7 @@ PALETTE = {
     "muted": (130, 151, 184),
     "outline": (222, 235, 255),
     "primary": (148, 212, 255),
+    "accent": (190, 227, 255),
     "water": (168, 221, 255),
     "water_dark": (123, 196, 252),
     "grass": (231, 247, 228),
@@ -49,6 +50,7 @@ class SceneRenderer:
         else:
             self.draw_world()
             self.draw_hud()
+        self.app.debug_console.draw(self.app.screen)
         draw_custom_cursor(self.app.screen, pygame.mouse.get_pos(), self.app.cloud_phase)
         pygame.display.flip()
 
@@ -99,8 +101,10 @@ class SceneRenderer:
             self.draw_player_shadow(screen_x, screen_y, player)
         self.draw_map_background()
         for player in players:
-            self.draw_player(player)
+            self.draw_player_body(player)
         self.draw_map_foreground()
+        for player in players:
+            self.draw_player_overlay(player)
         self.draw_handshakes()
 
     def draw_map_ground(self) -> None:
@@ -198,9 +202,8 @@ class SceneRenderer:
         pygame.draw.ellipse(front_gloss, (255, 255, 255, 55), (-4, -2, lip_rect.width * 0.8, lip_rect.height * 0.7))
         self.app.screen.blit(front_gloss, lip_rect.topleft)
 
-    def draw_player(self, player: PlayerView) -> None:
+    def draw_player_body(self, player: PlayerView) -> None:
         screen_x, screen_y = self.app.world_to_screen((player.display_x, player.display_y))
-        is_local = player.player_id == self.app.self_id
         jump_y = screen_y - int(player.jump_offset)
 
         glow_alpha = int(player.tint_level * 110)
@@ -221,6 +224,11 @@ class SceneRenderer:
         gloss_rect = pygame.Rect(0, 0, max(16, int(body_width * 0.42)), max(10, int(body_height * 0.3)))
         gloss_rect.center = (body_rect.centerx - body_width // 7, body_rect.centery - body_height // 5)
         pygame.draw.ellipse(self.app.screen, add_alpha((255, 255, 255), 185), gloss_rect)
+
+    def draw_player_overlay(self, player: PlayerView) -> None:
+        screen_x, screen_y = self.app.world_to_screen((player.display_x, player.display_y))
+        is_local = player.player_id == self.app.self_id
+        jump_y = screen_y - int(player.jump_offset)
 
         self.draw_direction_marker(screen_x, jump_y, player.facing, is_local)
         self.draw_halo(screen_x, jump_y, is_local)
