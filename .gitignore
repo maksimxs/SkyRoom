@@ -1,0 +1,14 @@
+.venv/
+.venv39/
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+servers.json
