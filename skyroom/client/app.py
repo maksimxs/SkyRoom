@@ -11,7 +11,7 @@ import pygame
 
 from ..config import CLIENT, ENDPOINT, NETWORK, SERVER
 from ..models import clamp, facing_from_vector, lerp
-from .chrome import AudioController, create_window_icon
+from .chrome import AudioController, apply_windows_app_id, create_window_icon
 from .debug import DebugConsole
 from .endpoint import EndpointClient
 from .network import ServerConnection
@@ -22,6 +22,7 @@ from .state import PlayerView, Toast
 class SkyroomClientApp:
     def __init__(self, host: str = NETWORK.host, port: int = NETWORK.port) -> None:
         os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+        apply_windows_app_id()
         pygame.init()
         pygame.font.init()
         pygame.display.set_caption("Skyroom")

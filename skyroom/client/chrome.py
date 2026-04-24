@@ -1,22 +1,17 @@
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
 import math
-import os
 import sys
 from typing import Optional
 
 import pygame
 
 
-def _optional_track_path(env_name: str) -> Optional[Path]:
-    raw_value = os.getenv(env_name, "").strip()
-    return Path(raw_value).expanduser() if raw_value else None
-
-
-LOGIN_TRACK = _optional_track_path("SKYROOM_LOGIN_MUSIC")
-WORLD_TRACK = _optional_track_path("SKYROOM_WORLD_MUSIC")
-ICON_ASSET = Path("assets/icon_bubble.ico")
+ASSETS_DIR = Path("assets")
+ICON_ASSET = Path("assets/icon_bubble.png")
+WINDOWS_APP_ID = "skyroom.app"
 
 
 def _resource_path(relative_path: Path) -> Path:
@@ -24,13 +19,32 @@ def _resource_path(relative_path: Path) -> Path:
     return base_path / relative_path
 
 
-def _triangle_points(center_x: int, center_y: int, radius: int, inverted: bool) -> list[tuple[int, int]]:
-    points = []
-    offset = math.pi / 2 if inverted else -math.pi / 2
-    for index in range(3):
-        angle = offset + index * (math.tau / 3)
-        points.append((int(center_x + math.cos(angle) * radius), int(center_y + math.sin(angle) * radius)))
-    return points
+def _asset_track_path(filename: str) -> Optional[Path]:
+    candidate = _resource_path(ASSETS_DIR / filename)
+    return candidate if candidate.exists() else None
+
+
+LOGIN_TRACK = _asset_track_path("login_music.mp3")
+WORLD_TRACK = _asset_track_path("world_music.mp3")
+
+
+def apply_windows_app_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except (AttributeError, OSError):
+        pass
+
+
+def _make_circular_icon(icon: pygame.Surface, size: int) -> pygame.Surface:
+    working = pygame.Surface((size, size), pygame.SRCALPHA)
+    working.blit(icon, (0, 0))
+    mask = pygame.Surface((size, size), pygame.SRCALPHA)
+    radius = max(6, size // 2 - max(1, size // 18))
+    pygame.draw.circle(mask, (255, 255, 255, 255), (size // 2, size // 2), radius)
+    working.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    return working
 
 
 def create_window_icon(size: int = 64) -> pygame.Surface:
@@ -40,23 +54,12 @@ def create_window_icon(size: int = 64) -> pygame.Surface:
             icon = pygame.image.load(str(icon_path))
             if size > 0 and icon.get_size() != (size, size):
                 icon = pygame.transform.smoothscale(icon, (size, size))
-            return icon.convert_alpha() if icon.get_alpha() is not None else icon.convert()
+            icon = icon.convert_alpha() if icon.get_alpha() is not None else icon.convert_alpha()
+            return _make_circular_icon(icon, size)
         except pygame.error:
             pass
 
-    surface = pygame.Surface((size, size), pygame.SRCALPHA)
-    center = size // 2
-    radius = int(size * 0.38)
-    width = max(4, size // 10)
-
-    up = _triangle_points(center, center, radius, False)
-    down = _triangle_points(center, center, radius, True)
-
-    pygame.draw.lines(surface, (10, 10, 16), True, up, width + 4)
-    pygame.draw.lines(surface, (10, 10, 16), True, down, width + 4)
-    pygame.draw.lines(surface, (58, 132, 255), True, up, width)
-    pygame.draw.lines(surface, (255, 220, 96), True, down, width)
-    return surface
+    return pygame.Surface((size, size), pygame.SRCALPHA)
 
 
 def draw_custom_cursor(screen: pygame.Surface, position: tuple[int, int], phase: float) -> None:

@@ -15,7 +15,7 @@ from typing import Callable, Optional
 import pygame
 
 from ..config import CLIENT, ENDPOINT, NETWORK, SERVICE
-from .chrome import create_window_icon, draw_custom_cursor
+from .chrome import apply_windows_app_id, create_window_icon, draw_custom_cursor
 from .debug import DebugConsole
 from .endpoint import EndpointClient, EndpointServerRecord
 from .rendering import PALETTE, pick_font_name
@@ -142,6 +142,7 @@ class ModalForm:
 class SkyroomLauncherApp:
     def __init__(self) -> None:
         os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+        apply_windows_app_id()
         pygame.init()
         pygame.font.init()
         pygame.display.set_caption("Skyroom")
