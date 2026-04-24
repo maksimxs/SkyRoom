@@ -12,6 +12,9 @@ import pygame
 class DebugEntry:
     created_at: float
     source: str
+    method: str
+    direction: str
+    level: str
     message: str
 
 
@@ -30,9 +33,25 @@ class DebugConsole:
         if self.visible:
             self.scroll_offset = 0
 
-    def log(self, source: str, message: str) -> None:
+    def log(
+        self,
+        source: str,
+        direction: str = "",
+        message: str = "",
+        method: str = "",
+        level: str = "INFO",
+    ) -> None:
         keep_tail = self.scroll_offset == 0
-        self.entries.append(DebugEntry(created_at=time.time(), source=source[:8], message=message))
+        self.entries.append(
+            DebugEntry(
+                created_at=time.time(),
+                source=source[:8],
+                method=method[:10],
+                direction=direction[:2],
+                level=level[:5],
+                message=message,
+            )
+        )
         if keep_tail:
             self.scroll_offset = 0
 
@@ -82,9 +101,11 @@ class DebugConsole:
 
         header = self.font_header.render("DEBUG CONSOLE", True, (202, 216, 232))
         screen.blit(header, (overlay_rect.x + 14, overlay_rect.y + 10))
+        columns = self.font.render("TIME       LEVEL SOURCE   DIR  METHOD     PAYLOAD", True, (128, 145, 162))
+        screen.blit(columns, (overlay_rect.x + 14, overlay_rect.y + 30))
 
-        y = overlay_rect.y + 40
-        max_lines = max(1, (overlay_rect.height - 52) // 18)
+        y = overlay_rect.y + 50
+        max_lines = max(1, (overlay_rect.height - 62) // 18)
         entries = list(self.entries)
         max_scroll = max(0, len(entries) - max_lines)
         self.scroll_offset = max(0, min(self.scroll_offset, max_scroll))
@@ -92,7 +113,7 @@ class DebugConsole:
         visible_entries = entries[start_index:start_index + max_lines]
         for entry in visible_entries:
             timestamp = time.strftime("%H:%M:%S", time.localtime(entry.created_at))
-            line = f"[{timestamp}] {entry.source:<8} {entry.message}"
+            line = f"{timestamp:<10} {entry.level:<5} {entry.source:<8} {entry.direction:<3} {entry.method:<10} {entry.message}"
             rendered = self.font.render(line, True, (196, 208, 221))
             screen.blit(rendered, (overlay_rect.x + 14, y))
             y += 18
@@ -107,7 +128,7 @@ class DebugConsole:
         self.overlay_rect = pygame.Rect(18, height - min(260, height - 36), width - 36, min(242, height - 48))
 
     def _max_scroll(self) -> int:
-        max_lines = max(1, (self.overlay_rect.height - 52) // 18)
+        max_lines = max(1, (self.overlay_rect.height - 62) // 18)
         return max(0, len(self.entries) - max_lines)
 
     @staticmethod

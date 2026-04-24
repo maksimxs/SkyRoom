@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from config import NETWORK, SERVER, SERVICE
+from config import ENDPOINT, NETWORK, SERVER, SERVICE
 from endpoint import EndpointAnnouncer
 from models import PlayerState, color_from_name, facing_from_vector, facing_towards, normalize
 from protocol import ProtocolError, decode_message, send_message
@@ -29,6 +29,7 @@ class GameServer:
         self.server: Optional[asyncio.AbstractServer] = None
         self.health_server: Optional[asyncio.AbstractServer] = None
         self._tick_task: Optional[asyncio.Task] = None
+        self._checkup_task: Optional[asyncio.Task] = None
         self.endpoint = EndpointAnnouncer()
 
     async def start(self) -> None:
@@ -42,8 +43,14 @@ class GameServer:
         health_addresses = ", ".join(str(sock.getsockname()) for sock in health_sockets)
         print(f"Skyroom remote health listening on {health_addresses}")
         await self.endpoint.check_up()
+        if self.endpoint.enabled and ENDPOINT.checkup_interval > 0:
+            self._checkup_task = asyncio.create_task(self.checkup_loop(), name="endpoint-checkup-loop")
 
     async def stop(self) -> None:
+        if self._checkup_task:
+            self._checkup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._checkup_task
         if self._tick_task:
             self._tick_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -88,7 +95,6 @@ class GameServer:
                 },
             )
             await self.broadcast_event({"type": "system", "message": f"{player.name} joined the room."})
-            asyncio.create_task(self.endpoint.check_up(), name=f"endpoint-check-up-{player_id}")
 
             while True:
                 payload = await self.read_message(reader)
@@ -117,10 +123,10 @@ class GameServer:
                 await self.respond_health(writer)
             else:
                 await self.respond_not_found(writer)
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            pass
         finally:
             writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
 
     async def read_message(self, reader: asyncio.StreamReader) -> dict[str, Any]:
         raw_line = await reader.readline()
@@ -197,6 +203,14 @@ class GameServer:
 
         if message_type == "toggle_glow":
             self.trigger_joy(player)
+            await self.broadcast_event(
+                {
+                    "type": "glow",
+                    "player_id": player.player_id,
+                    "name": player.name,
+                    "active": True,
+                }
+            )
             return
 
         if message_type == "chat":
@@ -204,12 +218,22 @@ class GameServer:
             if text:
                 player.chat_text = text
                 player.chat_until = time.time() + SERVER.chat_duration
+                await self.broadcast_event(
+                    {
+                        "type": "chat",
+                        "player_id": player.player_id,
+                        "name": player.name,
+                        "text": text,
+                    }
+                )
             return
 
         if message_type == "handshake":
-            self.try_handshake(player)
+            handshake_payload = self.try_handshake(player)
+            if handshake_payload:
+                await self.broadcast_event(handshake_payload)
 
-    def try_handshake(self, initiator: PlayerState) -> None:
+    def try_handshake(self, initiator: PlayerState) -> Optional[dict[str, Any]]:
         now = time.time()
         best_candidate: Optional[PlayerState] = None
         best_distance = SERVER.handshake_distance
@@ -223,7 +247,7 @@ class GameServer:
                 best_distance = distance
 
         if not best_candidate:
-            return
+            return None
 
         initiator.facing = facing_towards((initiator.x, initiator.y), (best_candidate.x, best_candidate.y), initiator.facing)
         best_candidate.facing = facing_towards((best_candidate.x, best_candidate.y), (initiator.x, initiator.y), best_candidate.facing)
@@ -233,6 +257,13 @@ class GameServer:
         best_candidate.handshake_until = now + SERVER.handshake_duration
         initiator.handshake_partner_id = best_candidate.player_id
         best_candidate.handshake_partner_id = initiator.player_id
+        return {
+            "type": "handshake",
+            "initiator_id": initiator.player_id,
+            "initiator_name": initiator.name,
+            "partner_id": best_candidate.player_id,
+            "partner_name": best_candidate.name,
+        }
 
     def trigger_joy(self, player: PlayerState) -> None:
         now = time.time()
@@ -241,6 +272,13 @@ class GameServer:
         player.joy_started_at = now
         player.joy_until = now + duration
         player.joy_seed = random.random()
+
+    async def checkup_loop(self) -> None:
+        interval = max(1.0, ENDPOINT.checkup_interval)
+        print(f"ENDPOINT periodic /check-up every {int(interval) if interval.is_integer() else interval}s")
+        while True:
+            await asyncio.sleep(interval)
+            await self.endpoint.check_up()
 
     async def game_loop(self) -> None:
         dt = 1.0 / SERVER.tick_rate

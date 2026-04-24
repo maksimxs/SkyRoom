@@ -14,7 +14,7 @@ class ServerConnection:
     QUIET_OUTGOING_TYPES = {"move", "turn", "click_move"}
     QUIET_INCOMING_TYPES = {"snapshot"}
 
-    def __init__(self, host: str, port: int, player_name: str, logger: Optional[Callable[[str, str], None]] = None) -> None:
+    def __init__(self, host: str, port: int, player_name: str, logger: Optional[Callable[[str, str, str, str, str], None]] = None) -> None:
         self.host = host
         self.port = port
         self.player_name = player_name
@@ -55,12 +55,10 @@ class ServerConnection:
     def _run(self) -> None:
         buffer = b""
         try:
-            self._log("SOCKET", f"connect {self.host}:{self.port}")
             sock = socket.create_connection((self.host, self.port), timeout=5.0)
             sock.setblocking(False)
             self._socket = sock
             self._send_direct({"type": "hello", "name": self.player_name})
-            self._log("SOCKET", f"connected {self.host}:{self.port}")
             self.incoming.put({"type": "connection_state", "state": "connected"})
 
             while not self._closed.is_set():
@@ -82,7 +80,6 @@ class ServerConnection:
                     self._log_packet("RESPONSE", payload, quiet_types=self.QUIET_INCOMING_TYPES)
                     self.incoming.put(payload)
         except (ConnectionError, OSError, ProtocolError) as exc:
-            self._log("SOCKET", f"disconnect {self.host}:{self.port} ({exc})")
             self.incoming.put({"type": "connection_state", "state": "error", "message": str(exc)})
         finally:
             self._closed.set()
@@ -101,9 +98,9 @@ class ServerConnection:
         self._log_packet("REQUEST", payload, quiet_types=self.QUIET_OUTGOING_TYPES)
         self._socket.sendall(encode_message(payload))
 
-    def _log(self, source: str, message: str) -> None:
+    def _log(self, source: str, direction: str, message: str, method: str = "", level: str = "INFO") -> None:
         if self.logger:
-            self.logger(source, message)
+            self.logger(source, direction, message, method, level)
 
     def _log_packet(self, direction: str, payload: dict[str, Any], quiet_types: set[str]) -> None:
         packet_type = str(payload.get("type", ""))
@@ -113,4 +110,5 @@ class ServerConnection:
             raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
             raw = str(payload)
-        self._log("SOCKET", f"{direction} {raw}")
+        arrow = "<-" if direction == "REQUEST" else "->"
+        self._log("SOCKET", arrow, raw, method="", level="INFO")

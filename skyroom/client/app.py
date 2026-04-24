@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import random
@@ -198,7 +197,6 @@ class SkyroomClientApp:
                 if state == "error":
                     self.connection_message = message.get("message", "Connection error")
                     self.push_toast(self.connection_message)
-                    self.debug_console.log("SOCKET", self.connection_message)
                 else:
                     self.connection_message = "Connected"
             elif message_type == "welcome":
@@ -354,7 +352,6 @@ class SkyroomClientApp:
             return
         self.player_join_reported = True
         online_count = max(1, len(self.players))
-        self.debug_console.log("ENDPOINT", f"queue /player-join online={online_count}")
         threading.Thread(
             target=self._send_player_join,
             args=(local_player.name, online_count),
@@ -370,7 +367,7 @@ class SkyroomClientApp:
             online=online_count,
         )
         if not ok and error:
-            self.debug_console.log("ENDPOINT", f"/player-join failed {error}")
+            return
 
     def log_snapshot_event(
         self,
@@ -378,47 +375,7 @@ class SkyroomClientApp:
         payload: dict[str, Any],
         logged_handshakes: set[tuple[str, str]],
     ) -> None:
-        name = str(payload.get("name", "Player")).strip() or "Player"
-        chat_text = str(payload.get("chat_text", "")).strip()
-        if chat_text and (previous is None or previous.chat_text != chat_text):
-            self.log_socket_snapshot_event(
-                {
-                    "type": "snapshot",
-                    "event": "chat",
-                    "player": name,
-                    "text": chat_text[:72],
-                }
-            )
-
-        glow_active = bool(payload.get("glow_active", False))
-        if glow_active and (previous is None or not previous.glow_active):
-            self.log_socket_snapshot_event(
-                {
-                    "type": "snapshot",
-                    "event": "glow",
-                    "player": name,
-                    "glow_active": True,
-                }
-            )
-
-        handshake_active = bool(payload.get("handshake_active", False))
-        partner_id = str(payload.get("handshake_partner_id", "") or "")
-        if handshake_active and partner_id:
-            pair = tuple(sorted((str(payload.get("id", "")), partner_id)))
-            if pair not in self.active_handshake_pairs and pair not in logged_handshakes:
-                partner_name = self.players.get(partner_id).name if partner_id in self.players else "someone"
-                self.log_socket_snapshot_event(
-                    {
-                        "type": "snapshot",
-                        "event": "handshake",
-                        "player": name,
-                        "partner": partner_name,
-                    }
-                )
-                logged_handshakes.add(pair)
-
-    def log_socket_snapshot_event(self, payload: dict[str, Any]) -> None:
-        self.debug_console.log("SOCKET", f"RESPONSE {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}")
+        return
 
     def login_button_rect(self) -> pygame.Rect:
         width, height = self.screen.get_size()

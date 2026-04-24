@@ -19,7 +19,7 @@ from ..config import SERVICE
 DEFAULT_SERVER_PATH = Path("servers.json")
 DEFAULT_BROWSER_STATE_PATH = Path("server_browser_state.json")
 HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)*[a-zA-Z0-9-]{1,63}$")
-LogFn = Optional[Callable[[str, str], None]]
+LogFn = Optional[Callable[[str, str, str, str, str], None]]
 
 
 @dataclass
@@ -185,7 +185,7 @@ class ServerStatusChecker:
     def check_once(self, server: ServerEntry) -> HealthResult:
         started = time.perf_counter()
         url = f"http://{server.host}:{SERVICE.health_port}/health"
-        self._log("HEALTH", f"REQUEST GET {url}")
+        self._log("SERVER", "<-", url, method="GET", level="INFO")
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as response:
                 body = response.read().decode("utf-8")
@@ -200,7 +200,7 @@ class ServerStatusChecker:
                     online_count=int(payload.get("online", 0)) if ok else None,
                     status_flag=ok,
                 )
-                self._log("HEALTH", f"RESPONSE GET {url} {payload}")
+                self._log("SERVER", "->", f"{url} {response.status} {payload}", method="GET", level="INFO")
         except (
             urllib.error.URLError,
             http.client.HTTPException,
@@ -211,7 +211,7 @@ class ServerStatusChecker:
             ValueError,
         ) as exc:
             result = HealthResult(online=False, ping_ms=None, checked_at=time.time(), status_flag=False)
-            self._log("HEALTH", f"RESPONSE GET {url} ERROR {exc}")
+            self._log("SERVER", "->", f"{url} ERROR {exc}", method="GET", level="ERROR")
         self.results[server.key] = result
         return result
 
@@ -234,9 +234,9 @@ class ServerStatusChecker:
         except Exception as exc:
             result = HealthResult(online=False, ping_ms=None, checked_at=time.time(), status_flag=False)
             url = f"http://{server.host}:{SERVICE.health_port}/health"
-            self._log("HEALTH", f"RESPONSE GET {url} ERROR unexpected {exc}")
+            self._log("SERVER", "->", f"{url} ERROR unexpected {exc}", method="GET", level="ERROR")
         self._queue.put((server.key, result))
 
-    def _log(self, source: str, message: str) -> None:
+    def _log(self, source: str, direction: str, message: str, method: str = "", level: str = "INFO") -> None:
         if self.logger:
-            self.logger(source, message)
+            self.logger(source, direction, message, method, level)

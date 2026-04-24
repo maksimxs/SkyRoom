@@ -531,7 +531,13 @@ class SkyroomLauncherApp:
         except Exception as exc:
             self.status = ""
             if self.debug_console:
-                self.debug_console.log("HEALTH", f"RESPONSE GET http://{server.host}:{SERVICE.health_port}/health ERROR unexpected {exc}")
+                self.debug_console.log(
+                    "SERVER",
+                    "->",
+                    f"http://{server.host}:{SERVICE.health_port}/health ERROR unexpected {exc}",
+                    "GET",
+                    "ERROR",
+                )
             self.push_toast(f"{server.name} is offline or unreachable.", kind="error")
             return
         if not result.online:
@@ -732,10 +738,10 @@ class SkyroomLauncherApp:
 
             dot_offset = 0
             if item.is_new:
-                marker = pygame.Rect(row.x + 14, row.y + 15, 8, row.height - 30)
-                pygame.draw.rect(self.screen, (250, 232, 156), marker, border_radius=4)
-                pygame.draw.rect(self.screen, (255, 248, 220), marker, width=1, border_radius=4)
-                dot_offset = 14
+                marker_center = (row.x + 24, row.centery)
+                pygame.draw.circle(self.screen, (250, 232, 156), marker_center, 6)
+                pygame.draw.circle(self.screen, (255, 248, 220), marker_center, 6, width=1)
+                dot_offset = 18
 
             health = self.checker.get(item.server)
             name = self.truncate(health.server_name or item.server.name, self.font_ui, row.width - 290)

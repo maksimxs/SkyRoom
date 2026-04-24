@@ -62,6 +62,7 @@ class ServiceConfig:
 class EndpointConfig:
     base_url: str = os.getenv("SKYROOM_ENDPOINT_BASE_URL", "https://api.skyroom1337.workers.dev").rstrip("/")
     timeout: float = _env_float("SKYROOM_ENDPOINT_TIMEOUT", 5.0)
+    checkup_interval: float = _env_float("SKYROOM_CHECKUP_INTERVAL", 180.0)
 
 
 NETWORK = NetworkConfig()

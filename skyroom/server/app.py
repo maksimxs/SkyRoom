@@ -123,10 +123,10 @@ class GameServer:
                 await self.respond_health(writer)
             else:
                 await self.respond_not_found(writer)
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            pass
         finally:
             writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
 
     async def respond_health(self, writer: asyncio.StreamWriter) -> None:
         payload = {
@@ -197,6 +197,14 @@ class GameServer:
 
         if message_type == "toggle_glow":
             self.trigger_joy(player)
+            await self.broadcast_event(
+                {
+                    "type": "glow",
+                    "player_id": player.player_id,
+                    "name": player.name,
+                    "active": True,
+                }
+            )
             return
 
         if message_type == "chat":
@@ -204,12 +212,22 @@ class GameServer:
             if text:
                 player.chat_text = text
                 player.chat_until = time.time() + SERVER.chat_duration
+                await self.broadcast_event(
+                    {
+                        "type": "chat",
+                        "player_id": player.player_id,
+                        "name": player.name,
+                        "text": text,
+                    }
+                )
             return
 
         if message_type == "handshake":
-            self.try_handshake(player)
+            handshake_payload = self.try_handshake(player)
+            if handshake_payload:
+                await self.broadcast_event(handshake_payload)
 
-    def try_handshake(self, initiator: PlayerState) -> None:
+    def try_handshake(self, initiator: PlayerState) -> Optional[dict[str, Any]]:
         now = time.time()
         best_candidate: Optional[PlayerState] = None
         best_distance = SERVER.handshake_distance
@@ -223,7 +241,7 @@ class GameServer:
                 best_distance = distance
 
         if not best_candidate:
-            return
+            return None
 
         initiator.facing = facing_towards((initiator.x, initiator.y), (best_candidate.x, best_candidate.y), initiator.facing)
         best_candidate.facing = facing_towards((best_candidate.x, best_candidate.y), (initiator.x, initiator.y), best_candidate.facing)
@@ -233,6 +251,13 @@ class GameServer:
         best_candidate.handshake_until = now + SERVER.handshake_duration
         initiator.handshake_partner_id = best_candidate.player_id
         best_candidate.handshake_partner_id = initiator.player_id
+        return {
+            "type": "handshake",
+            "initiator_id": initiator.player_id,
+            "initiator_name": initiator.name,
+            "partner_id": best_candidate.player_id,
+            "partner_name": best_candidate.name,
+        }
 
     def trigger_joy(self, player: PlayerState) -> None:
         now = time.time()

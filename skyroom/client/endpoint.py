@@ -10,7 +10,7 @@ from typing import Callable, Optional
 from ..config import ENDPOINT
 
 
-LogFn = Optional[Callable[[str, str], None]]
+LogFn = Optional[Callable[[str, str, str, str, str], None]]
 
 
 @dataclass
@@ -65,17 +65,17 @@ class EndpointClient:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"} if payload is not None else {}
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        self._log("ENDPOINT", f"REQUEST {method} {path}" + (f" {payload}" if payload is not None else ""))
+        self._log("ENDPOINT", "<-", f"{path}" + (f" {payload}" if payload is not None else ""), method=method, level="INFO")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = response.read().decode("utf-8")
                 parsed = json.loads(body) if body else {}
-                self._log("ENDPOINT", f"RESPONSE {method} {path} {response.status} {parsed}")
+                self._log("ENDPOINT", "->", f"{path} {response.status} {parsed}", method=method, level="INFO")
                 return parsed if isinstance(parsed, dict) else {}, True, ""
         except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
-            self._log("ENDPOINT", f"RESPONSE {method} {path} ERROR {exc}")
+            self._log("ENDPOINT", "->", f"{path} ERROR {exc}", method=method, level="ERROR")
             return {}, False, str(exc)
 
-    def _log(self, source: str, message: str) -> None:
+    def _log(self, source: str, direction: str, message: str, method: str = "", level: str = "INFO") -> None:
         if self.logger:
-            self.logger(source, message)
+            self.logger(source, direction, message, method, level)

@@ -16,7 +16,7 @@ class EndpointAnnouncer:
     async def check_up(self) -> None:
         if not self.enabled:
             if ENDPOINT.base_url and not SERVICE.public_host.strip():
-                print("ENDPOINT /check-up skipped: SKYROOM_PUBLIC_HOST is not set.")
+                self._log("skip /check-up: SKYROOM_PUBLIC_HOST is not set")
             return
         payload = {
             "server_name": SERVICE.server_name,
@@ -25,9 +25,9 @@ class EndpointAnnouncer:
         }
         try:
             await asyncio.to_thread(self._post_json, "/check-up", payload)
-            print(f"ENDPOINT /check-up ok: {SERVICE.server_name} {SERVICE.public_host}:{SERVICE.public_port}")
+            self._log(f"/check-up ok {SERVICE.server_name} {SERVICE.public_host}:{SERVICE.public_port}")
         except Exception as exc:
-            print(f"ENDPOINT /check-up failed: {exc}")
+            self._log(f"/check-up failed {exc}")
 
     def _post_json(self, path: str, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -42,3 +42,7 @@ class EndpointAnnouncer:
                 response.read()
         except urllib.error.URLError as exc:
             raise RuntimeError(str(exc)) from exc
+
+    @staticmethod
+    def _log(message: str) -> None:
+        print(f"ENDPOINT {message}")
