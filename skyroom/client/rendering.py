@@ -50,6 +50,7 @@ class SceneRenderer:
         else:
             self.draw_world()
             self.draw_hud()
+            self.draw_context_menu()
         self.app.debug_console.draw(self.app.screen)
         draw_custom_cursor(self.app.screen, pygame.mouse.get_pos(), self.app.cloud_phase)
         pygame.display.flip()
@@ -148,12 +149,22 @@ class SceneRenderer:
     def draw_lake(self, obstacle: dict[str, Any]) -> None:
         center = self.app.world_to_screen((obstacle["x"], obstacle["y"]))
         radius = int(obstacle["radius"])
+        fill, outline, shimmer = {
+            "pearl_lake": ((192, 229, 255), (138, 198, 245), (255, 255, 255, 96)),
+            "sky_mirror": ((182, 223, 255), (126, 188, 240), (255, 255, 255, 92)),
+            "mint_lagoon": ((186, 239, 226), (124, 211, 187), (245, 255, 252, 98)),
+            "halo_water": ((207, 227, 255), (157, 195, 243), (255, 255, 255, 82)),
+            "soft_basin": ((229, 233, 255), (181, 191, 244), (255, 252, 255, 88)),
+            "glass_tide": ((203, 245, 255), (136, 214, 243), (255, 255, 255, 100)),
+            "blush_pool": ((255, 224, 238), (240, 188, 215), (255, 255, 255, 90)),
+            "dew_lake": ((211, 241, 230), (149, 214, 195), (248, 255, 251, 92)),
+        }.get(obstacle.get("kind"), (PALETTE["water"], PALETTE["water_dark"], (255, 255, 255, 90)))
         shadow = pygame.Surface((radius * 3, radius * 3), pygame.SRCALPHA)
         pygame.draw.circle(shadow, (128, 188, 255, 45), (shadow.get_width() // 2, shadow.get_height() // 2 + 12), radius + 22)
         self.app.screen.blit(shadow, (center[0] - shadow.get_width() // 2, center[1] - shadow.get_height() // 2))
-        pygame.draw.circle(self.app.screen, PALETTE["water"], center, radius)
-        pygame.draw.circle(self.app.screen, PALETTE["water_dark"], center, radius, width=5)
-        pygame.draw.circle(self.app.screen, add_alpha((255, 255, 255), 90), (center[0] - radius // 3, center[1] - radius // 3), radius // 3)
+        pygame.draw.circle(self.app.screen, fill, center, radius)
+        pygame.draw.circle(self.app.screen, outline, center, radius, width=5)
+        pygame.draw.circle(self.app.screen, shimmer, (center[0] - radius // 3, center[1] - radius // 3), radius // 3)
         label = self.app.font_small.render(obstacle["label"], True, PALETTE["muted"])
         self.app.screen.blit(label, label.get_rect(center=(center[0], center[1] + radius + 18)))
 
@@ -370,6 +381,36 @@ class SceneRenderer:
             self.draw_pill(toast_rect, add_alpha((255, 255, 255), alpha))
             text_surface = self.app.font_small.render(toast.text, True, PALETTE["text"])
             self.app.screen.blit(text_surface, text_surface.get_rect(center=toast_rect.center))
+
+    def draw_context_menu(self) -> None:
+        if not self.app.context_menu_pos:
+            self.app.context_menu_action_rects = []
+            return
+        items = self.app.context_menu_items()
+        if not items:
+            self.app.context_menu_action_rects = []
+            return
+
+        item_height = 42
+        width = 216 if len(items) > 2 else 188
+        height = 18 + len(items) * item_height
+        x, y = self.app.context_menu_pos
+        x = min(x, self.app.screen.get_width() - width - 18)
+        y = min(y, self.app.screen.get_height() - height - 18)
+        panel = pygame.Rect(x, y, width, height)
+        self.draw_shadowed_panel(panel, alpha=240)
+
+        self.app.context_menu_action_rects = []
+        mouse = pygame.mouse.get_pos()
+        for index, (action, label) in enumerate(items):
+            button_rect = pygame.Rect(panel.x + 10, panel.y + 10 + index * item_height, panel.width - 20, 34)
+            hovered = button_rect.collidepoint(mouse)
+            fill = (247, 251, 255, 245) if hovered else (242, 248, 255, 220)
+            pygame.draw.rect(self.app.screen, fill, button_rect, border_radius=14)
+            pygame.draw.rect(self.app.screen, add_alpha(PALETTE["outline"], 230), button_rect, width=1, border_radius=14)
+            text_surface = self.app.font_small.render(label, True, PALETTE["text"])
+            self.app.screen.blit(text_surface, text_surface.get_rect(center=button_rect.center))
+            self.app.context_menu_action_rects.append((action, button_rect))
 
     def draw_shadowed_panel(self, rect: pygame.Rect, alpha: int) -> None:
         shadow = pygame.Surface((rect.width + 24, rect.height + 24), pygame.SRCALPHA)

@@ -87,8 +87,8 @@ def _player_overlap(candidate_x: float, candidate_y: float, other: PlayerState, 
 
 @dataclass
 class MapLayout:
-    width: int = 1800
-    height: int = 1200
+    width: int = 2200
+    height: int = 1450
     obstacles: List[Obstacle] = field(default_factory=list)
     spawn_points: List[Tuple[float, float]] = field(default_factory=list)
 
@@ -97,12 +97,14 @@ class MapLayout:
         rng = random.Random()
         obstacles: List[Obstacle] = []
         lake_candidates = [
-            (320, 300, 130, "Pearl Lake"),
-            (540, 900, 120, "Sky Mirror"),
-            (930, 220, 125, "Mint Lagoon"),
-            (1320, 320, 115, "Halo Water"),
-            (1450, 860, 140, "Soft Basin"),
-            (1040, 930, 130, "Glass Tide"),
+            (280, 260, 125, "pearl_lake", "Pearl Lake"),
+            (700, 1110, 118, "sky_mirror", "Sky Mirror"),
+            (1040, 250, 122, "mint_lagoon", "Mint Lagoon"),
+            (1530, 315, 116, "halo_water", "Halo Water"),
+            (1850, 1060, 138, "soft_basin", "Soft Basin"),
+            (1260, 980, 128, "glass_tide", "Glass Tide"),
+            (450, 760, 112, "blush_pool", "Blush Pool"),
+            (1890, 560, 120, "dew_lake", "Dew Lake"),
         ]
         block_candidates = [
             (220, 520, 220, 120, "flower_bed", "Bloom Path"),
@@ -112,14 +114,31 @@ class MapLayout:
             (600, 720, 220, 120, "flower_bed", "Ribbon Garden"),
             (1220, 180, 200, 120, "glass_garden", "Dew Court"),
             (880, 820, 170, 220, "crystal_tree", "Pearl Arbor"),
+            (1620, 210, 210, 122, "glass_garden", "Mint Arcade"),
+            (1760, 720, 234, 128, "cloud_pavilion", "Halo Terrace"),
+            (280, 960, 242, 126, "flower_bed", "Rose Ribbon"),
+            (980, 1130, 212, 132, "cloud_pavilion", "Soft Veranda"),
+            (1320, 760, 162, 248, "crystal_tree", "Silk Canopy"),
+            (1880, 860, 214, 124, "glass_garden", "Opal Court"),
+            (540, 250, 178, 214, "crystal_tree", "Bloom Tower"),
+            (910, 600, 232, 124, "flower_bed", "Petal Ribbon"),
         ]
 
-        for x, y, radius, label in rng.sample(lake_candidates, len(lake_candidates)):
-            candidate = CircleObstacle(x + rng.randint(-35, 35), y + rng.randint(-35, 35), radius + rng.randint(-16, 16), "lake", label)
-            if any(_obstacles_overlap(candidate, placed, 85.0) for placed in obstacles):
+        for x, y, radius, kind, label in rng.sample(lake_candidates, len(lake_candidates)):
+            candidate = CircleObstacle(
+                x + rng.randint(-28, 28),
+                y + rng.randint(-28, 28),
+                radius + rng.randint(-12, 12),
+                kind,
+                label,
+            )
+            if any(
+                _obstacles_overlap(candidate, placed, 210.0 if isinstance(placed, CircleObstacle) else 100.0)
+                for placed in obstacles
+            ):
                 continue
             obstacles.append(candidate)
-            if len([item for item in obstacles if isinstance(item, CircleObstacle)]) == 3:
+            if len([item for item in obstacles if isinstance(item, CircleObstacle)]) == 4:
                 break
 
         for x, y, width, height, kind, label in rng.sample(block_candidates, len(block_candidates)):
@@ -127,16 +146,20 @@ class MapLayout:
             if any(_obstacles_overlap(candidate, placed, 90.0) for placed in obstacles):
                 continue
             obstacles.append(candidate)
-            if len([item for item in obstacles if isinstance(item, RectObstacle)]) == 4:
+            if len([item for item in obstacles if isinstance(item, RectObstacle)]) == 8:
                 break
 
         spawn_points = [
             (220, 180),
             (300, 160),
-            (220, 1040),
+            (220, 1240),
+            (520, 1220),
             (1560, 200),
-            (1620, 980),
-            (920, 1080),
+            (1940, 240),
+            (1980, 1180),
+            (1600, 1260),
+            (1120, 1280),
+            (760, 240),
         ]
         return cls(obstacles=obstacles, spawn_points=spawn_points)
 

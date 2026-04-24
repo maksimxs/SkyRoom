@@ -61,6 +61,10 @@ class SkyroomClientApp:
         self.mouse_walk_active = False
         self.last_mouse_walk_sent_at = 0.0
         self.last_mouse_walk_target = (-9999.0, -9999.0)
+        self.context_menu_pos: Optional[tuple[int, int]] = None
+        self.context_menu_target_id: Optional[str] = None
+        self.context_menu_action_rects: list[tuple[str, pygame.Rect]] = []
+        self.pending_handshake_target_id: Optional[str] = None
         rng = random.Random(time.time_ns())
         self.cloud_specs = [
             {
@@ -141,9 +145,12 @@ class SkyroomClientApp:
                     self.chat_input += event.unicode
                 return
 
+            if event.key == pygame.K_ESCAPE and self.context_menu_pos:
+                self.close_context_menu()
+                return
+
             if event.key == pygame.K_RETURN:
-                self.chat_mode = True
-                self.chat_input = ""
+                self.open_chat()
             elif event.key == pygame.K_q and self.connection:
                 self.connection.send({"type": "toggle_glow"})
             elif event.key == pygame.K_e:
@@ -153,11 +160,21 @@ class SkyroomClientApp:
                 else:
                     self.push_toast("No one nearby for a handshake yet.")
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not self.chat_mode:
-            if self.connection and self.self_id and self.self_id in self.players:
-                self.mouse_walk_active = True
-                world_x, world_y = self.screen_to_world(event.pos)
-                self.connection.send({"type": "click_move", "x": world_x, "y": world_y})
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 3 and not self.chat_mode:
+                self.open_context_menu(event.pos)
+                return
+            if event.button == 1:
+                if self.context_menu_pos:
+                    if self.handle_context_menu_click(event.pos):
+                        return
+                    self.close_context_menu()
+                    return
+                if not self.chat_mode and self.connection and self.self_id and self.self_id in self.players:
+                    self.pending_handshake_target_id = None
+                    self.mouse_walk_active = True
+                    world_x, world_y = self.screen_to_world(event.pos)
+                    self.connection.send({"type": "click_move", "x": world_x, "y": world_y})
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self.mouse_walk_active = False
@@ -181,6 +198,10 @@ class SkyroomClientApp:
         self.camera_y = 0.0
         self.last_move_payload = (999.0, 999.0)
         self.player_join_reported = False
+        self.context_menu_pos = None
+        self.context_menu_target_id = None
+        self.context_menu_action_rects.clear()
+        self.pending_handshake_target_id = None
         self.connection = ServerConnection(self.server_host, self.server_port, name, logger=self.debug_console.log)
         self.connection.start()
         self.connection_state = "connecting"
@@ -207,6 +228,8 @@ class SkyroomClientApp:
                 self.connection_message = f"{self.server_host}:{self.server_port}"
                 self.audio.set_scene("world")
                 self.active_handshake_pairs.clear()
+                self.close_context_menu()
+                self.pending_handshake_target_id = None
             elif message_type == "snapshot":
                 self.apply_snapshot(message)
                 self.maybe_report_player_join()
@@ -263,6 +286,7 @@ class SkyroomClientApp:
         if self.scene == "world":
             self.send_movement_if_needed()
             self.update_mouse_walk()
+            self.update_pending_handshake()
             self.update_camera(dt)
 
         for player_id, player in self.players.items():
@@ -278,6 +302,7 @@ class SkyroomClientApp:
         if magnitude:
             move_x /= magnitude
             move_y /= magnitude
+            self.pending_handshake_target_id = None
 
         payload = (round(move_x, 3), round(move_y, 3))
         if payload != self.last_move_payload:
@@ -323,6 +348,26 @@ class SkyroomClientApp:
         self.last_mouse_walk_target = (world_x, world_y)
         self.last_mouse_walk_sent_at = now
 
+    def update_pending_handshake(self) -> None:
+        if not self.pending_handshake_target_id or not self.connection:
+            return
+        local_player = self.players.get(self.self_id or "")
+        target_player = self.players.get(self.pending_handshake_target_id)
+        if not local_player or not target_player:
+            self.pending_handshake_target_id = None
+            return
+        distance = math.hypot(target_player.x - local_player.x, target_player.y - local_player.y)
+        if distance <= SERVER.handshake_distance:
+            self.connection.send({"type": "handshake"})
+            self.pending_handshake_target_id = None
+            return
+        now = time.time()
+        if now - self.last_mouse_walk_sent_at < CLIENT.move_send_interval:
+            return
+        self.connection.send({"type": "click_move", "x": target_player.x, "y": target_player.y})
+        self.last_mouse_walk_target = (target_player.x, target_player.y)
+        self.last_mouse_walk_sent_at = now
+
     def player_nearby(self) -> bool:
         local_player = self.players.get(self.self_id or "")
         if not local_player:
@@ -343,6 +388,92 @@ class SkyroomClientApp:
     def push_toast(self, text: str) -> None:
         if text:
             self.toasts.insert(0, Toast(text=text, created_at=time.time()))
+
+    def open_chat(self, prefix: str = "") -> None:
+        self.chat_mode = True
+        self.chat_input = prefix
+        self.close_context_menu()
+
+    def open_context_menu(self, pos: tuple[int, int]) -> None:
+        self.context_menu_target_id = self.player_id_at_screen_pos(pos)
+        self.context_menu_pos = pos
+        self.context_menu_action_rects.clear()
+        self.mouse_walk_active = False
+
+    def close_context_menu(self) -> None:
+        self.context_menu_pos = None
+        self.context_menu_target_id = None
+        self.context_menu_action_rects.clear()
+
+    def context_menu_items(self) -> list[tuple[str, str]]:
+        if self.context_menu_target_id and self.context_menu_target_id in self.players:
+            target = self.players[self.context_menu_target_id]
+            return [
+                ("chat_to", f"Chat @{self.clipped_tag_name(target.name)}"),
+                ("glow", "Glow"),
+                ("handshake", "Handshake"),
+            ]
+        return [("chat", "Chat"), ("glow", "Glow")]
+
+    def handle_context_menu_click(self, pos: tuple[int, int]) -> bool:
+        for action, rect in self.context_menu_action_rects:
+            if rect.collidepoint(pos):
+                self.activate_context_action(action)
+                return True
+        return False
+
+    def activate_context_action(self, action: str) -> None:
+        if action == "chat":
+            self.open_chat()
+            return
+        if action == "chat_to":
+            target = self.players.get(self.context_menu_target_id or "")
+            prefix = f"@{self.clipped_tag_name(target.name)} " if target else ""
+            self.open_chat(prefix)
+            return
+        if action == "glow":
+            if self.connection:
+                self.connection.send({"type": "toggle_glow"})
+            self.close_context_menu()
+            return
+        if action == "handshake":
+            self.begin_handshake_to_target(self.context_menu_target_id)
+            self.close_context_menu()
+
+    def begin_handshake_to_target(self, target_id: Optional[str]) -> None:
+        if not target_id or not self.connection or target_id == self.self_id:
+            return
+        local_player = self.players.get(self.self_id or "")
+        target_player = self.players.get(target_id)
+        if not local_player or not target_player:
+            return
+        self.pending_handshake_target_id = target_id
+        self.mouse_walk_active = False
+        self.last_mouse_walk_sent_at = 0.0
+        self.connection.send({"type": "click_move", "x": target_player.x, "y": target_player.y})
+        distance = math.hypot(target_player.x - local_player.x, target_player.y - local_player.y)
+        if distance <= SERVER.handshake_distance:
+            self.connection.send({"type": "handshake"})
+            self.pending_handshake_target_id = None
+
+    def player_id_at_screen_pos(self, pos: tuple[int, int]) -> Optional[str]:
+        best_id: Optional[str] = None
+        best_distance = 9999.0
+        for player_id, player in self.players.items():
+            if player_id == self.self_id:
+                continue
+            screen_x, screen_y = self.world_to_screen((player.display_x, player.display_y))
+            jump_y = screen_y - int(player.jump_offset)
+            distance = math.hypot(pos[0] - screen_x, pos[1] - jump_y)
+            if distance <= 34.0 and distance < best_distance:
+                best_id = player_id
+                best_distance = distance
+        return best_id
+
+    @staticmethod
+    def clipped_tag_name(name: str, limit: int = 12) -> str:
+        clean = " ".join(name.split()).strip() or "player"
+        return clean if len(clean) <= limit else clean[: max(1, limit - 3)].rstrip() + "..."
 
     def maybe_report_player_join(self) -> None:
         if self.player_join_reported or not self.self_id:
