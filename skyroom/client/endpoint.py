@@ -60,10 +60,19 @@ class EndpointClient:
         response, ok, error = self._request("POST", "/player-join", payload)
         return ok and bool(response.get("status", False)), error
 
+    def post_entry(self) -> tuple[bool, str]:
+        response, ok, error = self._request("POST", "/entry", {})
+        return ok and bool(response.get("status", False)), error
+
     def _request(self, method: str, path: str, payload: Optional[dict] = None) -> tuple[dict, bool, str]:
         url = f"{self.base_url}{path}"
         data = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "curl/8.0.1",
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         self._log("ENDPOINT", "<-", f"{path}" + (f" {payload}" if payload is not None else ""), method=method, level="INFO")
         try:

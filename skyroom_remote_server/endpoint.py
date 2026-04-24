@@ -34,7 +34,11 @@ class EndpointAnnouncer:
         request = urllib.request.Request(
             f"{ENDPOINT.base_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "curl/8.0.1",
+            },
             method="POST",
         )
         try:

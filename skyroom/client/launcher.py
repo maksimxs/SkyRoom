@@ -26,6 +26,8 @@ from .state import add_alpha, blend
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SERVERS_PATH = PROJECT_ROOT / "servers.json"
 BROWSER_STATE_PATH = PROJECT_ROOT / "server_browser_state.json"
+LOCAL_SERVER_HOST = "127.0.0.1"
+LOCAL_SERVER_NAME = "Local Skyroom"
 
 
 @dataclass
@@ -52,6 +54,7 @@ class DisplayedServer:
     from_endpoint: bool
     endpoint_status: bool
     is_new: bool
+    is_localhost: bool = False
 
     @property
     def key(self) -> str:
@@ -167,6 +170,7 @@ class SkyroomLauncherApp:
         self.new_endpoint_keys: set[str] = set()
         self.endpoint_loading = False
         self.endpoint_queue: "queue.Queue[tuple[bool, list[EndpointServerRecord], str]]" = queue.Queue()
+        self.local_server_queue: "queue.Queue[tuple[str, int, bool, str]]" = queue.Queue()
         self.selected_server = 0
         self.signal_rects: list[tuple[pygame.Rect, DisplayedServer]] = []
         self.toasts: list[LauncherToast] = []
@@ -176,6 +180,8 @@ class SkyroomLauncherApp:
         self.last_click_index: Optional[int] = None
         self.last_click_at = 0.0
         self.cloud_phase = 0.0
+        self.entry_reported = False
+        self.local_server_autostarted = False
         rng = random.Random(time.time_ns())
         self.cloud_specs = [
             {
@@ -191,16 +197,53 @@ class SkyroomLauncherApp:
         ]
 
     def run(self) -> None:
+        self.bootstrap_background_services()
         while self.running:
             dt = min(0.05, self.clock.tick(CLIENT.fps) / 1000.0)
             self.cloud_phase += dt
             self.cleanup_finished()
             self.update_toasts()
             self.consume_endpoint_results()
+            self.consume_local_server_results()
             self.checker.tick([item.server for item in self.displayed_servers()])
             self.handle_events()
             self.draw()
         self.shutdown()
+
+    def bootstrap_background_services(self) -> None:
+        self.report_entry_once()
+        self.autostart_local_server()
+
+    def report_entry_once(self) -> None:
+        if self.entry_reported:
+            return
+        self.entry_reported = True
+        threading.Thread(target=self._send_entry_worker, daemon=True).start()
+
+    def _send_entry_worker(self) -> None:
+        self.endpoint.post_entry()
+
+    def localhost_server_entry(self) -> ServerEntry:
+        return ServerEntry(LOCAL_SERVER_NAME, LOCAL_SERVER_HOST, NETWORK.port)
+
+    def local_server_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["SKYROOM_HOST"] = LOCAL_SERVER_HOST
+        env["SKYROOM_PORT"] = str(NETWORK.port)
+        env["SKYROOM_HEALTH_PORT"] = str(SERVICE.health_port)
+        env["SKYROOM_SERVER_NAME"] = LOCAL_SERVER_NAME
+        env.pop("SKYROOM_PUBLIC_HOST", None)
+        env.pop("SKYROOM_PUBLIC_PORT", None)
+        env.pop("SKYROOM_ENDPOINT_BASE_URL", None)
+        env.pop("SKYROOM_CHECKUP_INTERVAL", None)
+        return env
+
+    def autostart_local_server(self) -> None:
+        if self.local_server_autostarted:
+            return
+        self.local_server_autostarted = True
+        self.start_server(auto=True)
 
     def main_menu_buttons(self) -> list[Button]:
         width, height = self.screen.get_size()
@@ -281,6 +324,24 @@ class SkyroomLauncherApp:
     def displayed_servers(self) -> list[DisplayedServer]:
         combined: dict[str, DisplayedServer] = {}
         ordered_keys: list[str] = []
+        localhost_server = self.localhost_server_entry()
+        localhost_index = next(
+            (
+                index
+                for index, local_server in enumerate(self.store.servers)
+                if local_server.host.strip().lower() == localhost_server.host.lower() and local_server.port == localhost_server.port
+            ),
+            None,
+        )
+        combined[localhost_server.key] = DisplayedServer(
+            server=localhost_server,
+            local_index=localhost_index,
+            from_endpoint=False,
+            endpoint_status=False,
+            is_new=False,
+            is_localhost=True,
+        )
+        ordered_keys.append(localhost_server.key)
         for record in self.endpoint_servers:
             key = record.key
             if key not in combined:
@@ -330,6 +391,25 @@ class SkyroomLauncherApp:
         if self.server_process and self.server_process.process.poll() is not None:
             self.server_process = None
 
+    def consume_local_server_results(self) -> None:
+        while True:
+            try:
+                state, pid, auto, message = self.local_server_queue.get_nowait()
+            except queue.Empty:
+                return
+            if self.server_process and self.server_process.process.pid == pid and state in {"already_running", "failed"}:
+                self.server_process = None
+            self.checker.refresh_now([self.localhost_server_entry()])
+            self.status = message
+            if state == "started":
+                self.debug_console.log("LOCALHOST", "->", message, "LOCAL", "INFO")
+            elif state == "already_running":
+                self.debug_console.log("LOCALHOST", "->", message, "LOCAL", "WARN")
+            else:
+                self.debug_console.log("LOCALHOST", "->", message, "LOCAL", "ERROR")
+            if not auto and state != "started":
+                self.push_toast(message, kind="error" if state == "failed" else "info")
+
     def update_toasts(self) -> None:
         now = time.time()
         self.toasts = [toast for toast in self.toasts if now - toast.created_at <= toast.duration]
@@ -353,13 +433,42 @@ class SkyroomLauncherApp:
         self.context_menu_kind = None
         self.status = ""
 
-    def start_server(self) -> None:
+    def start_server(self, *, auto: bool = False) -> None:
         if self.server_process and self.server_process.process.poll() is None:
             self.status = "Local server is already running."
+            self.debug_console.log("LOCALHOST", "->", "Local server is already running.", "LOCAL", "INFO")
             return
-        process = subprocess.Popen([sys.executable, "server.py"], cwd=PROJECT_ROOT)
+        self.debug_console.log("LOCALHOST", "<-", f"Launch local server {LOCAL_SERVER_HOST}:{NETWORK.port}", "LOCAL", "INFO")
+        try:
+            process = subprocess.Popen([sys.executable, "server.py"], cwd=PROJECT_ROOT, env=self.local_server_env())
+        except OSError as exc:
+            message = f"Local server launch failed: {exc}"
+            self.status = message
+            self.debug_console.log("LOCALHOST", "->", message, "LOCAL", "ERROR")
+            if not auto:
+                self.push_toast("Local server is unavailable.", kind="error")
+            return
         self.server_process = ManagedProcess("server", process)
-        self.status = "Local server started."
+        self.status = "Starting local server..."
+        threading.Thread(
+            target=self._verify_local_server_start,
+            args=(process.pid, auto),
+            daemon=True,
+        ).start()
+
+    def _verify_local_server_start(self, pid: int, auto: bool) -> None:
+        time.sleep(0.8)
+        managed = self.server_process
+        if not managed or managed.process.pid != pid:
+            return
+        if managed.process.poll() is None:
+            self.local_server_queue.put(("started", pid, auto, "Local server is running on localhost."))
+            return
+        result = self.checker.check_once(self.localhost_server_entry())
+        if result.online:
+            self.local_server_queue.put(("already_running", pid, auto, "Local server is already available on localhost."))
+        else:
+            self.local_server_queue.put(("failed", pid, auto, "Local server is unavailable or the port is busy."))
 
     def start_client(
         self,
@@ -671,7 +780,6 @@ class SkyroomLauncherApp:
         self.screen.blit(subtitle, subtitle.get_rect(center=(panel.centerx, panel.y + 118)))
         for button in self.main_menu_buttons():
             self.draw_glossy_button(button)
-        self.draw_status_line(panel.bottom - 34)
 
     def draw_offline(self) -> None:
         width, height = self.screen.get_size()
@@ -746,7 +854,12 @@ class SkyroomLauncherApp:
             health = self.checker.get(item.server)
             name = self.truncate(health.server_name or item.server.name, self.font_ui, row.width - 290)
             host = self.truncate(f"{item.server.host}:{item.server.port}", self.font_small, row.width - 290)
-            self.screen.blit(self.font_ui.render(name, True, PALETTE["text"]), (row.x + 22 + dot_offset, row.y + 10))
+            name_x = row.x + 22 + dot_offset
+            name_y = row.y + 10
+            name_surface = self.font_ui.render(name, True, PALETTE["text"])
+            self.screen.blit(name_surface, (name_x, name_y))
+            if item.is_localhost:
+                self.draw_localhost_badge(name_x + name_surface.get_width() + 12, row.y + 13)
             self.screen.blit(self.font_small.render(host, True, PALETTE["muted"]), (row.x + 22 + dot_offset, row.y + 39))
 
             if health.online_count is not None:
@@ -770,6 +883,15 @@ class SkyroomLauncherApp:
             color = active_colors.get(bars, inactive) if index <= bars else inactive
             pygame.draw.rect(self.screen, color, bar, border_radius=5)
             pygame.draw.rect(self.screen, (255, 255, 255, 150), bar, width=1, border_radius=5)
+
+    def draw_localhost_badge(self, x: int, y: int) -> None:
+        label = self.font_small.render("localhost", True, PALETTE["muted"])
+        badge = label.get_rect(topleft=(x, y)).inflate(16, 8)
+        pill = pygame.Surface(badge.size, pygame.SRCALPHA)
+        pygame.draw.rect(pill, (246, 250, 255, 208), pill.get_rect(), border_radius=14)
+        pygame.draw.rect(pill, add_alpha(PALETTE["outline"], 230), pill.get_rect(), width=1, border_radius=14)
+        self.screen.blit(pill, badge.topleft)
+        self.screen.blit(label, label.get_rect(center=badge.center))
 
     def draw_hover_tooltip(self) -> None:
         mouse = pygame.mouse.get_pos()
