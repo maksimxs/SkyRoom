@@ -3,23 +3,25 @@ from __future__ import annotations
 from pathlib import Path
 import math
 import os
+import sys
 from typing import Optional
 
 import pygame
 
 
-LOGIN_TRACK = Path(
-    os.getenv(
-        "SKYROOM_LOGIN_MUSIC",
-        r"C:\Users\Blossom\Downloads\Aexion - Velvet - ArpWire TV (192k).mp3",
-    )
-)
-WORLD_TRACK = Path(
-    os.getenv(
-        "SKYROOM_WORLD_MUSIC",
-        r"C:\Users\Blossom\Downloads\Mom and Dad's Computer - Couch Meditation - thanksforloitering (192k).mp3",
-    )
-)
+def _optional_track_path(env_name: str) -> Optional[Path]:
+    raw_value = os.getenv(env_name, "").strip()
+    return Path(raw_value).expanduser() if raw_value else None
+
+
+LOGIN_TRACK = _optional_track_path("SKYROOM_LOGIN_MUSIC")
+WORLD_TRACK = _optional_track_path("SKYROOM_WORLD_MUSIC")
+ICON_ASSET = Path("assets/icon_bubble.ico")
+
+
+def _resource_path(relative_path: Path) -> Path:
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+    return base_path / relative_path
 
 
 def _triangle_points(center_x: int, center_y: int, radius: int, inverted: bool) -> list[tuple[int, int]]:
@@ -32,6 +34,16 @@ def _triangle_points(center_x: int, center_y: int, radius: int, inverted: bool) 
 
 
 def create_window_icon(size: int = 64) -> pygame.Surface:
+    icon_path = _resource_path(ICON_ASSET)
+    if icon_path.exists():
+        try:
+            icon = pygame.image.load(str(icon_path))
+            if size > 0 and icon.get_size() != (size, size):
+                icon = pygame.transform.smoothscale(icon, (size, size))
+            return icon.convert_alpha() if icon.get_alpha() is not None else icon.convert()
+        except pygame.error:
+            pass
+
     surface = pygame.Surface((size, size), pygame.SRCALPHA)
     center = size // 2
     radius = int(size * 0.38)
@@ -85,6 +97,8 @@ class AudioController:
             return
 
         track = LOGIN_TRACK if scene == "login" else WORLD_TRACK
+        if not track:
+            return
         volume = 0.04 if scene == "login" else 0.06
         if self.current_track == track:
             return

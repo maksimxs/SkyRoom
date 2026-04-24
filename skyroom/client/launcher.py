@@ -28,6 +28,7 @@ SERVERS_PATH = PROJECT_ROOT / "servers.json"
 BROWSER_STATE_PATH = PROJECT_ROOT / "server_browser_state.json"
 LOCAL_SERVER_HOST = "127.0.0.1"
 LOCAL_SERVER_NAME = "Local Skyroom"
+ROLE_FLAG = "--skyroom-role"
 
 
 @dataclass
@@ -226,6 +227,13 @@ class SkyroomLauncherApp:
     def localhost_server_entry(self) -> ServerEntry:
         return ServerEntry(LOCAL_SERVER_NAME, LOCAL_SERVER_HOST, NETWORK.port)
 
+    @staticmethod
+    def runtime_command(role: str) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, ROLE_FLAG, role]
+        script_name = "server.py" if role == "server" else "client.py"
+        return [sys.executable, script_name]
+
     def local_server_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -323,7 +331,6 @@ class SkyroomLauncherApp:
 
     def displayed_servers(self) -> list[DisplayedServer]:
         combined: dict[str, DisplayedServer] = {}
-        ordered_keys: list[str] = []
         localhost_server = self.localhost_server_entry()
         localhost_index = next(
             (
@@ -341,7 +348,6 @@ class SkyroomLauncherApp:
             is_new=False,
             is_localhost=True,
         )
-        ordered_keys.append(localhost_server.key)
         for record in self.endpoint_servers:
             key = record.key
             if key not in combined:
@@ -352,15 +358,24 @@ class SkyroomLauncherApp:
                     endpoint_status=record.status,
                     is_new=key in self.new_endpoint_keys,
                 )
-                ordered_keys.append(key)
         for index, local_server in enumerate(self.store.servers):
             key = local_server.key
             if key in combined:
                 combined[key].local_index = index
                 continue
             combined[key] = DisplayedServer(local_server, index, False, False, False)
-            ordered_keys.append(key)
-        return [combined[key] for key in ordered_keys]
+        localhost_item = combined.pop(localhost_server.key)
+        sorted_items = sorted(
+            combined.values(),
+            key=lambda item: (
+                -(self.checker.get(item.server).online_count or 0),
+                -int(self.checker.get(item.server).online),
+                item.server.name.lower(),
+                item.server.host.lower(),
+                item.server.port,
+            ),
+        )
+        return [localhost_item, *sorted_items]
 
     def consume_endpoint_results(self) -> None:
         while True:
@@ -440,7 +455,7 @@ class SkyroomLauncherApp:
             return
         self.debug_console.log("LOCALHOST", "<-", f"Launch local server {LOCAL_SERVER_HOST}:{NETWORK.port}", "LOCAL", "INFO")
         try:
-            process = subprocess.Popen([sys.executable, "server.py"], cwd=PROJECT_ROOT, env=self.local_server_env())
+            process = subprocess.Popen(self.runtime_command("server"), cwd=PROJECT_ROOT, env=self.local_server_env())
         except OSError as exc:
             message = f"Local server launch failed: {exc}"
             self.status = message
@@ -486,7 +501,7 @@ class SkyroomLauncherApp:
         env["SKYROOM_PORT"] = str(port)
         if server_name:
             env["SKYROOM_SERVER_NAME"] = server_name
-        process = subprocess.Popen([sys.executable, "client.py"], cwd=PROJECT_ROOT, env=env)
+        process = subprocess.Popen(self.runtime_command("client"), cwd=PROJECT_ROOT, env=env)
         self.client_processes.append(ManagedProcess(f"client-{self.client_counter}", process))
         self.status = f"Opened client for {host}:{port}."
 
